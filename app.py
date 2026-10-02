@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import signal
 import socket
@@ -15,7 +16,8 @@ from backends import MockArm, VendorArm, extension_path, load_sdk
 from control import Controller, Limits
 from protocol import JsonLineDecoder, ProtocolError
 
-DEFAULT_SDK = Path(__file__).resolve().parent / "vendor/ARX_X5/py/arx_x5_python"
+BUNDLED_SDK = Path(__file__).resolve().parent / "vendor/ARX_X5/py/arx_x5_python"
+DEFAULT_SDK = Path(os.environ.get("ARX_SDK_ROOT", str(BUNDLED_SDK)))
 
 
 class SerialInput:

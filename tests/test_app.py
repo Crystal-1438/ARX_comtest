@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from app import DEFAULT_SDK, decoder_from_path, load_limits, run
+from app import BUNDLED_SDK, decoder_from_path, load_limits, run
 from backends import MockArm
 from protocol import Command
 
@@ -12,10 +12,10 @@ from protocol import Command
 class AppTests(unittest.TestCase):
     def test_default_sdk_is_bundled_with_required_files(self):
         project = Path(__file__).resolve().parents[1]
-        self.assertEqual(DEFAULT_SDK, project / "vendor/ARX_X5/py/arx_x5_python")
+        self.assertEqual(BUNDLED_SDK, project / "vendor/ARX_X5/py/arx_x5_python")
         for name in ("bimanual/src/single_arm_interface.cpp", "bimanual/script/x5.urdf",
                      "bimanual/script/x5_2025.urdf", "bimanual/lib/arx_x5_src/libarx_x5_src.so"):
-            self.assertTrue((DEFAULT_SDK / name).is_file(), name)
+            self.assertTrue((BUNDLED_SDK / name).is_file(), name)
 
     def test_custom_decoder_contract(self):
         with tempfile.TemporaryDirectory() as directory:
