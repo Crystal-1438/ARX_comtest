@@ -2,6 +2,7 @@
 """Single-arm ARX X5 monitor / serial teleoperation without ROS or network servers."""
 
 import argparse
+from contextlib import ExitStack
 import importlib.util
 import json
 import math
@@ -12,13 +13,17 @@ import socket
 import sys
 import time
 
-from backends import MockArm, VendorArm, extension_path, load_sdk
+from backends import MockArm, VendorArm, VendorChatter, extension_path, load_sdk
 from control import Controller, Limits
 from operator_keys import KeyInput, NullInput
 from protocol import JsonLineDecoder, ProtocolError
 
 BUNDLED_SDK = Path(__file__).resolve().parent / "vendor/ARX_X5/py/arx_x5_python"
 DEFAULT_SDK = Path(os.environ.get("ARX_SDK_ROOT", str(BUNDLED_SDK)))
+# Where the vendor SDK's own console output goes while the arm is open. It
+# announces itself on construction and its destructor announces the motors it
+# releases, and both would otherwise land in the middle of the readout.
+DEFAULT_ARM_LOG = "teleop_arm.log"
 
 
 class SerialInput:
@@ -167,7 +172,45 @@ def due_for_print(now, next_print, seen, state, reason):
     return now >= next_print or (state, reason) != seen
 
 
-def emit(controller, joints, backend, decoder=None):
+def watch_line(clock, controller, joints, decoder):
+    """One line for a person, instead of the JSON record.
+
+    The JSON record carries everything and is unreadable at any rate a person
+    can watch. This is the other half of the same data: the state, and -- while
+    stopped -- how far each joint still has to be turned to be in the pose the
+    arm is in, which is the number the operator is moving the leader to zero.
+    The gate and this display are the same measurement, so the line turns good
+    exactly when pressing a would work.
+
+    A decoder need not offer it; one that does not gets the state alone, which
+    is all a wire protocol with its own arm/stop can be watched for.
+    """
+    line = f"{clock} {controller.state:<7}"
+    if controller.state != "STOPPED":
+        return f"{line} | {controller.reason}"
+    distance = getattr(decoder, "distance", None)
+    reading = distance(joints) if distance is not None else None
+    if reading is None:
+        return f"{line} | waiting for the leader's first frame"
+    line += " | " + "  ".join(f"J{index + 1} {turn:+6.1f}"
+                              for index, turn in enumerate(reading["turn_deg"]))
+    if reading["outside"]:
+        return line + "  | out of pose: " + " ".join(
+            f"J{index + 1}" for index in reading["outside"]) + (
+            f" (tolerance {reading['tolerance_deg']:.0f} deg)")
+    return line + "  | in the arm's pose, press a"
+
+
+def publish(controller, joints, backend, decoder, stream, watch):
+    """Write this pass's line: the machine record, or the one a person reads."""
+    if watch:
+        print(watch_line(time.strftime("%H:%M:%S"), controller, joints, decoder),
+              file=stream, flush=True)
+    else:
+        emit(controller, joints, backend, decoder, stream)
+
+
+def emit(controller, joints, backend, decoder=None, stream=None):
     record = {
         "state": controller.state, "reason": controller.reason,
         "backend": backend, "stop_mode": controller.arm.stop_mode,
@@ -180,7 +223,7 @@ def emit(controller, joints, backend, decoder=None):
     telemetry = getattr(decoder, "last_telemetry", None)
     if telemetry is not None:
         record["leader"] = telemetry
-    print(json.dumps(record, ensure_ascii=False), flush=True)
+    print(json.dumps(record, ensure_ascii=False), file=stream or sys.stdout, flush=True)
 
 
 def run(args):
@@ -208,6 +251,8 @@ def run(args):
     source = arm = controller = operator = None
     interrupted = False
     previous_handlers = {}
+    stream = sys.stdout
+    stack = ExitStack()
 
     def request_stop(_signal, _frame):
         nonlocal interrupted
@@ -220,6 +265,14 @@ def run(args):
         if args.mode == "teleop":
             source = DemoInput() if args.demo else SerialInput(args.serial, args.baud)
             operator = KeyInput() if args.operator_keys else NullInput()
+        # Entered here, after the serial port is open so a failure to open it is
+        # still reported on the real console, and left open until after arm.close()
+        # below: the vendor library announces itself on construction and its
+        # destructor announces the motors it releases, and the readout is where
+        # neither belongs. Everything this program prints goes to `stream`, the
+        # duplicate taken before the redirection.
+        if hardware:
+            stream = stack.enter_context(VendorChatter(args.arm_log))
         arm = (VendorArm(args.sdk_root, args.can_port, args.model, args.stop_mode)
                if hardware else MockArm(args.stop_mode))
         controller = Controller(arm, limits, time.monotonic())
@@ -258,7 +311,7 @@ def run(args):
                     controller.stop(f"invalid serial input: {exc}", fault=True)
             joints = controller.tick(time.monotonic())
             if due_for_print(now, next_print, previous, controller.state, controller.reason):
-                emit(controller, joints, args.backend, decoder)
+                publish(controller, joints, args.backend, decoder, stream, args.watch)
                 next_print = now + 1 / args.print_rate
                 previous = (controller.state, controller.reason)
             next_tick += 1 / args.rate
@@ -268,13 +321,16 @@ def run(args):
             else:
                 next_tick = time.monotonic()  # No burst of catch-up motion commands.
         controller.stop("program exit")
-        emit(controller, controller.arm.read_joints(), args.backend, decoder)
+        publish(controller, controller.arm.read_joints(), args.backend, decoder,
+                stream, args.watch)
         return 0
     finally:
         try:
             if arm is not None:
                 arm.close()
         finally:
+            # After close(), so the SDK's parting words go to the log too.
+            stack.close()
             if source is not None:
                 source.close()
             if operator is not None:
@@ -309,6 +365,12 @@ def main(argv=None):
     parser.add_argument("--limits", type=Path, help="JSON limits in vendor joint coordinates/radians")
     parser.add_argument("--rate", type=positive, default=100.0)
     parser.add_argument("--print-rate", type=positive, default=10.0)
+    parser.add_argument("--watch", action="store_true",
+                        help="print a one-line readout instead of the JSON record: the state, "
+                             "and how far each joint still has to be turned to be in the arm's pose")
+    parser.add_argument("--arm-log", type=Path, default=Path(DEFAULT_ARM_LOG),
+                        help="where the vendor SDK's own console output goes, so it stays out "
+                             "of the readout (hardware only)")
     parser.add_argument("--duration", type=positive, help="optional runtime in seconds")
     parser.add_argument("--demo", action="store_true", help="mock-only generated JSON input")
     args = parser.parse_args(argv)

@@ -14,12 +14,14 @@ from unittest import mock
 
 from leader_calibrate import (
     JITTER_WARN_DEG, MIN_FRAMES, MIN_POSES, InteractiveSession, SamplingDecoder,
-    VendorChatter, build_map, check_map_loads, collect, confirm_release, fit_joint,
+    build_map, check_map_loads, collect, confirm_release, fit_joint,
     fit_session, fitted_evidence, fitted_joints, least_squares, load_session, main,
     pose_problems, shortest_delta, single_point_map, summarise,
     treat_sigterm_as_interrupt, unwrap_from_reference, verify_directions,
 )
 from leader_map import Mapper, load_mapping
+# Shared with app.py's hardware path, hence backends rather than the tool.
+from backends import VendorChatter
 
 # Six leader poses and the per-joint offsets the arm angles are built from, so a
 # correct fit has to recover exactly these numbers. Every joint moves well past

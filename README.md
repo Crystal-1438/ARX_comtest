@@ -265,11 +265,34 @@ bash scripts/run.sh --mode teleop --backend mock \
 按键先于同批串口帧处理，所以本地停止不会被同一批的目标盖过。
 FAULT 后必须先按 `s` 再按 `a`，与线协议恢复语义一致。
 
-**看不清就调 `--print-rate`**：默认 10 行/秒，一行是一整条 JSON，实际读不过来。
-调低（`--print-rate 1` 甚至 `0.2`）不会漏掉关键信息——**`state` 或 `reason` 一变就立刻打一行**，
-不等定时器，所以按 `a` 的结果（`armed at measured position`，或那句
-`refusing to arm: ...`）永远当场出现。定时器只管"什么都没变"时的心跳行。
-想只盯状态变化，把输出喂给过滤器即可（按键从终端读，不受管道影响）：
+**更省事：`--watch` 加 `--print-rate 1`。** `--watch` 把整条 JSON 换成一行，
+每关节报"还要转多少度才到机械臂现在的姿态"，与 `a` 的门禁是**同一个数**，
+所以这一行变好的瞬间就是按 `a` 能成的瞬间：
+
+```bash
+bash scripts/run.sh --mode teleop --backend mock \
+  --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00 \
+  --decoder "$PWD/leader_decoder.py" --operator-keys --limits limits.json \
+  --watch --print-rate 1
+```
+
+```
+01:28:38 STOPPED | J1   +0.0  J2  +35.1  J3   +0.0  J4   +0.0  J5 -129.1  J6   +0.0  | out of pose: J2 J5 (tolerance 30 deg)
+01:28:40 STOPPED | J1   +0.0  J2  +33.8  J3   +0.0  J4   +0.0  J5   -0.4  J6   +0.0  | out of pose: J2 (tolerance 30 deg)
+01:28:44 STOPPED | J1   +0.0  J2   +0.9  J3   +0.0  J4   +0.0  J5   -0.2  J6   +0.0  | in the arm's pose, press a
+01:28:45 ACTIVE  | armed at measured position
+```
+
+第一列是时钟，`ACTIVE`/`FAULT` 时只报状态与理由（这时已经没什么可转的）。
+`1 hz` 是打印频率，控制循环仍是 `--rate`（默认 100 Hz）；`--watch` 下不需要再管道过滤。
+**厂商 SDK 自己打的 "ARX方舟无限" 不进这个画面**：它从 C++ 直接写 fd 1/2，被重定向到
+`--arm-log`（默认 `teleop_arm.log`）——要看它去翻那个文件。
+
+**不加 `--watch` 时**默认 10 行/秒、一行一整条 JSON，读不过来，用 `--print-rate` 调低。
+调低不会漏掉关键信息——**`state` 或 `reason` 一变就立刻打一行**，不等定时器，
+所以按 `a` 的结果（`armed at measured position`，或那句 `refusing to arm: ...`）
+永远当场出现。定时器只管"什么都没变"时的心跳行。
+想只要 JSON 里的状态变化，把输出喂给过滤器即可（按键从终端读，不受管道影响）：
 
 ```bash
 ... --operator-keys --limits limits.json | python3 -u -c '
@@ -299,15 +322,17 @@ for line in sys.stdin:
 `reason` 里逐关节写出**要转到哪儿**和**为什么**，机械臂一个目标都不会收到：
 
 ```
-refusing to arm: the leader and the arm are not in the same pose: J2 reads 14.2 deg where
-the arm's pose calls for 322.8 (turn it -51.4 deg); J5 reads 41.3 deg where the arm's pose
-calls for 309.7 (turn it -91.6 deg). Arming here would move J2 -51.4 deg and J5 +91.6 deg
+refusing to arm: the leader and the arm are not in the same pose: J2 reads 287.9 deg where
+the arm's pose calls for 323.0 (turn it +35.1 deg); J5 reads 78.8 deg where the arm's pose
+calls for 309.7 (turn it -129.1 deg). Arming here would move J2 +35.1 deg and J5 +129.1 deg
 (tolerance 30 deg). Hand-match the leader to the arm and press a again
 ```
 
-两个数**等大**，方向各自与关节的 `sign` 有关：`turn it -51.4 deg` 是**你要转的**
-（最短圈，符号是方向），`move J2 -51.4 deg` 是**真按下去机械臂会走的**（J2 的 `sign`
-是 −1，所以两者同向；`sign` 为 +1 的 J5 就是 `turn it -91.6` 对 `move +91.6`）。
+**`reads` 就是板子上那三个数除以 10**（287.9 对应板子上的 `2879`），不是展开后的内部值——
+转过 `0/360` 的关节也在这一圈里报，照着板子对得上。
+两个数**等大**，方向各自与关节的 `sign` 有关：`turn it +35.1 deg` 是**你要转的**
+（最短圈，符号是方向），`move J2 +35.1 deg` 是**真按下去机械臂会走的**（J2 的 `sign`
+是 −1，所以两者同向；`sign` 为 +1 的 J5 就是 `turn it -129.1` 对 `move +129.1`）。
 按 `a` 的瞬间给每个关节定了一整圈（2π 的整数倍）的偏置，把单圈编码器看不出的圈数补上，
 之后一直带着它映射——所以 `0/360` 的另一侧不再是问题，见下面「按 `a` 时的整圈锚定」一节。
 

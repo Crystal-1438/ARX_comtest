@@ -262,6 +262,57 @@ class AnchorTests(unittest.TestCase):
         self.assertIn("turn it +40.0", blocker)  # what the operator has to do
         self.assertIn("move J1 -40.0 deg", blocker)  # and what arming would do instead
 
+    def test_it_is_the_same_number_the_refusal_quotes(self):
+        # The point of watching these: the line reaches zero exactly when
+        # pressing a would work, because it is the same measurement.
+        decoder = self.decoder()
+        feed(decoder, b"40,3281,1060,2353,2875,2085,500")
+        arm = self.arm_at(44.0, *VALID_DEG[1:])
+        reading = decoder.distance(arm)
+        self.assertAlmostEqual(reading["turn_deg"][0], 40.0)
+        self.assertEqual(reading["outside"], [0])
+        self.assertEqual(reading["tolerance_deg"], 30.0)
+        self.assertIn("turn it +40.0", decoder.anchor(arm))
+
+    def test_watching_never_chooses_the_turn(self):
+        # This pose anchors. Watching it must still leave the bias alone: a bias
+        # picked up while the leader merely passes through would be carried into
+        # the session, and the turn is only decided at the moment of arming.
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        decoder.distance(self.arm_at(*VALID_DEG))
+        self.assertEqual(decoder.mapper.bias, [0.0] * 6)
+
+    def test_it_reaches_zero_in_the_arm_s_pose(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        reading = decoder.distance(self.arm_at(*VALID_DEG))
+        # Radians and back does not round-trip exactly on every joint, so the
+        # residue is 1e-14 and not 0 -- which is why the readout is printed to
+        # one decimal and the tolerance is a whole number of degrees.
+        for index, turn in enumerate(reading["turn_deg"]):
+            with self.subTest(joint=index + 1):
+                self.assertAlmostEqual(turn, 0.0, places=9)
+        self.assertEqual(reading["outside"], [])
+
+    def test_before_a_frame_there_is_nothing_to_report(self):
+        self.assertIsNone(self.decoder().distance((0.0,) * 6))
+
+    def test_the_refusal_quotes_the_reading_the_board_shows(self):
+        # The operator's live refusal: the leader had been turned past the
+        # rollover, so the mapper's continuous value was -72.1 while the board
+        # read 287.9. Both are the same angle, but only one of them is on the
+        # screen being looked at, and the turn is measured from it.
+        decoder = self.decoder()
+        feed(decoder, b"40,3281,1060,2353,2875,2085,500")
+        feed(decoder, b"2879,3281,1060,2353,2875,2085,500")   # J1 down through zero
+        self.assertAlmostEqual(decoder.mapper.continuous[0], -72.1)
+        blocker = decoder.anchor(self.arm_at(323.0, *VALID_DEG[1:]))
+        self.assertIn("reads 287.9 deg", blocker)
+        self.assertIn("arm's pose calls for 323.0", blocker)
+        self.assertIn("turn it +35.1 deg", blocker)
+        self.assertNotIn("-72.1", blocker)
+
     def test_the_refusal_names_every_joint_that_is_out(self):
         # Naming only the worst sends the operator round once per joint.
         decoder = self.decoder()

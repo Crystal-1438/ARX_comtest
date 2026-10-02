@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app import (BUNDLED_SDK, check_decoder_for_hardware, decoder_from_path,
-                 due_for_print, install_arm_check, load_limits, run)
+                 due_for_print, install_arm_check, load_limits, run, watch_line)
 from backends import MockArm
 from control import Controller, Limits
 from protocol import Command, JsonLineDecoder, ProtocolError
@@ -21,7 +21,7 @@ def arguments(**overrides):
     values = dict(mode="teleop", backend="mock", model=None, demo=False, serial="unused",
                   limits=None, rate=100, decoder=None, leader_map=None, operator_keys=False,
                   baud=115200, stop_mode="soft", duration=0.05, print_rate=10, sdk_root=None,
-                  can_port="can0")
+                  can_port="can0", watch=False, arm_log=Path("unused.log"))
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -95,6 +95,62 @@ class AppTests(unittest.TestCase):
                                                leader_map=mapping)), 0)
                 # run() exports the override; the decoder reads it at load time.
                 self.assertEqual(os.environ["ARX_LEADER_MAP"], str(mapping))
+
+
+class WatchLineTests(unittest.TestCase):
+    """The line a person reads, which the JSON record is not: on hardware it is
+    a wall of text at any rate anyone can watch, and it does not say what to do
+    about it."""
+
+    def controller(self, state="STOPPED", reason="startup"):
+        controller = Mock(state=state, reason=reason)
+        return controller
+
+    def decoder(self, reading):
+        return Mock(distance=Mock(return_value=reading))
+
+    def line(self, reading, state="STOPPED", reason="startup"):
+        return watch_line("12:00:00", self.controller(state, reason),
+                          (0.1,) * 6, self.decoder(reading))
+
+    def test_it_shows_every_joint_s_turn_to_the_arm_s_pose(self):
+        line = self.line({"turn_deg": [0.0, 35.1, -0.2, 0.0, -129.1, 0.0],
+                          "outside": [1, 4], "tolerance_deg": 30.0})
+        self.assertTrue(line.startswith("12:00:00 STOPPED"))
+        for index, turn in ((1, "+35.1"), (2, "-0.2"), (5, "-129.1")):
+            with self.subTest(index=index):
+                self.assertIn(f"J{index + 1}", line)
+                self.assertIn(turn, line)
+        self.assertIn("out of pose: J2 J5", line)
+        self.assertIn("tolerance 30", line)
+
+    def test_it_says_when_pressing_a_would_work(self):
+        line = self.line({"turn_deg": [0.0, 1.0, -0.2, 0.0, 2.0, 0.0],
+                          "outside": [], "tolerance_deg": 30.0})
+        self.assertIn("in the arm's pose, press a", line)
+        self.assertNotIn("out of pose", line)
+
+    def test_before_a_frame_it_says_so_rather_than_showing_zeroes(self):
+        # Zeroes would read as "already in the pose", which is the one wrong
+        # answer: there is nothing to compare yet and pressing a is refused.
+        line = self.line(None)
+        self.assertIn("waiting for the leader's first frame", line)
+        self.assertNotIn("J1", line)
+
+    def test_a_decoder_that_offers_no_distance_still_gets_a_line(self):
+        line = watch_line("12:00:00", self.controller(), (0.1,) * 6, JsonLineDecoder())
+        self.assertEqual(line, "12:00:00 STOPPED | waiting for the leader's first frame")
+
+    def test_once_armed_it_reports_the_state_rather_than_a_turn(self):
+        # There is nothing left to turn once the leader has been matched; the
+        # joints are following it.
+        line = self.line(None, state="ACTIVE", reason="armed at measured position")
+        self.assertEqual(line, "12:00:00 ACTIVE  | armed at measured position")
+
+    def test_a_fault_reports_its_reason(self):
+        line = self.line(None, state="FAULT", reason="no data from the leader board")
+        self.assertIn("FAULT", line)
+        self.assertIn("no data from the leader board", line)
 
 
 class PrintThrottleTests(unittest.TestCase):

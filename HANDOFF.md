@@ -212,6 +212,25 @@ J7 为夹爪 ADC（`0..1000`）。
 - `anchor()` **不抛异常**：它跑在 `Controller._apply("arm")` 里，抛出去会穿到 `main()`
   被 `except ValueError` 接住直接退出 2——没收到帧就按 `a` 会**杀掉进程**。没帧时返回
   理由字符串。
+- `distance(arm_radians)` 是**只读**的同一个量：逐关节 `shortest_turn(needed, now)`，
+  即 `--watch` 行上的数字，也是拒绝信息里"turn it"的数字。它**故意不选圈**——选圈是
+  `anchor()` 的事，只在按 `a` 那一刻做一次；观看到的瞬时值若写进 `bias`，手从旁边扫过
+  也会被带进会话。没帧时返回 `None`。
+
+**给人看的输出**（`--watch` + `--print-rate`）。默认打印的是整条 JSON 记录，里面含整个
+`leader` 块——真机上是一面墙，且不说该做什么。`--watch` 换成一行：
+`<时钟> <STATE> | J1 .. J6 的转角度数 | out of pose: ...` 或 `in the arm's pose, press a`
+（ACTIVE 时只报状态与理由，因为已经没什么可转的）。`watch_line()` 与门禁测的是**同一个
+数字**，所以这一行变好的瞬间就是按 `a` 能成的瞬间。解码器不提供 `distance()` 时
+（`JsonLineDecoder`）退回只打状态。`--print-rate` 只影响打印，控制循环仍是 `--rate`。
+
+**厂商 SDK 的打印**：`VendorChatter` 在 fd 层面把 1/2 重定向到 `--arm-log`
+（`app.py` 默认 `teleop_arm.log`，标定工具默认 `calibration_arm.log`），它构造与析构都会
+打印（"ARX方舟无限"）。类现在住在 `backends.py`——`app.py` 与 `leader_calibrate.py` 都要用，
+又都在 import 厂商后端，放在 `app.py` 会形成循环。程序自己的输出走它 `dup` 出来的那份
+fd（`run()` 里的 `stream`），并且 `stack.close()` 排在 `arm.close()` **之后**，让 SDK 的
+临别话也进日志。**1 和 2 分别 dup**：从 1 的副本恢复 2 会把被重定向的 stderr 丢掉
+（这个 bug 已被 `VendorChatterTests` 固定）。
 
 **序号冲突的解法**（不要改回去）：decoder 的 `seq` 与 `controller.last_seq` 是两个独立
 空间。`control.py` 早就让 `stop` 豁免序号单调检查，现在把 `arm` 也纳入这条「操作员通道」
@@ -401,7 +420,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 261 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 277 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -409,13 +428,14 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | 交互式标定测试 | 注入伪 source/arm/keys/clock：滚动窗口只含当前姿态、撤销、未动够的关节被点名、`f` 失败留在循环里、整圈跑完写出可加载的 map、提前 `q` 以退出码 2 结束且留下的姿态能被 `fit` 直接使用 |
 | 单点 + 手输方向（离线） | 六个 `+`/`-` 写出可加载的 map 并被 `Mapper` 复现出采样到的臂角；offset 不折 ±180；backspace 退格；`x` 不写文件；没有姿态/没有 `--arm` 时给出原因；复核通过才写、**位移与符号相反时点名拒绝**、**一个关节都复核不到也拒绝写**、没动的关节报为未复核（`DirectionTests` 用纯函数直接验这四种判定） |
 | `session` 端到端（PTY 终端 + PTY 串口，无 SDK） | 真按键 → 真串口 → 采集 1 个姿态、退出码 2、arm.log 为空（未加载厂商库） |
-| `VendorChatter` fd 重定向 | fd 1/2 都进日志、退出后两个 fd 都回到原目标（分别 dup，不共用副本） |
+| `VendorChatter` fd 重定向 | fd 1/2 都进日志、退出后两个 fd 都回到原目标（分别 dup，不共用副本）。类住在 `backends.py`（`app.py` 与 `leader_calibrate.py` 共用），测试仍在 `tests/test_leader_calibrate.py::VendorChatterTests` |
 | 重力补偿接线（离线，无硬件） | `set_arm_status(3)` 恰好一次、跟踪目标时拒绝切模式、`close()` 后最后一条是 SOFT；`--arm` 的构造→进 3→读→`close()` 顺序；`confirm_release` 确认才 `stop()`、stdin 关闭也回 SOFT；**中断路径不进确认提示但 `close()` 仍执行** |
 | SIGTERM 处理 | 真给自己发 SIGTERM：变成 `KeyboardInterrupt`（若未安装处理器，测试进程会被直接杀掉，不会静默通过）；处理前后 `SIGTERM` 处理器被恢复 |
 | 重力补偿真机 | **操作者反馈"基本能用"**（2026-10-03，未量化）：跑完过一次 `session --arm`（1 个 301 帧、0 坏帧的姿态，见第 12.14 节），据此认为状态 3 能托住机械臂，标定流程不需要再等它 |
 | 真机标定产物 | 已生成 `leader_map.json`（方向 `+ − − − + −`，手输，**未经第二姿态复核**），见第 12.14 节 |
 | 整圈锚定与 arm 门禁（离线） | `resolve_turns` 的整圈性质（`turns` 是 360 的整数倍、残差恒在 ±180° 内、残差 ≡ −`shortest_turn` 模一圈，两函数钉在一起防漂移）、30° 边界两侧、跨 `0/360` 的 10° 必须放行（旧判据报 −350°）；`Mapper.anchor` 只在 `ok` 时写 `bias`、`reset()` 连 `bias` 一起清、`bias` 只进 `to_radians` 不污染 `continuous`（标定工具读它）；拒绝信息给"要转多少"与"会走多少"（大小相等，`-residual` 对 `sign * residual`）并列出**所有**不合格关节；解码器 `anchor()` 在首帧离 `reference_deg` 好几百时仍放行、没帧时**返回理由而不是抛**、握手/`reset()`/`ProtocolError` 后清偏置需重新 anchor、没 anchor 过时 `leader.anchor` 是 `null`；`Controller.pre_arm` 的**两条 arm 路都过**（串口帧与本地按键各一条测试）、被拒时 `arm.writes` 为空且 `arm.start` 未被调用、FAULT 下不触发 hook；map 校验 `reference_deg` 的长度/数值/`0..360` 区间（字段保留但不再是门禁）；PTY 端到端：左右同姿态→`a` 进 ACTIVE、偏 90°→`reason` 点名 J3 且 `joints_rad` 全程为 0（机械臂一个目标都没收到）、移回去重按即进 ACTIVE、首帧之前按 `a` 被拒、跨 `0/360` 的 10° 装上 360° 偏置并继续同向跟随 |
 | 状态行打印节流（离线） | `due_for_print` 直接单测：未到间隔不打、到点打、`state` 变立刻打、**`state` 不变而 `reason` 变也立刻打**、同一条不重复打；PTY 里把 `--print-rate` 压到 1 Hz 跑约 2 s，记录数必须仍是"几条"而不是随 100 Hz 控制循环走（**把 `next_print` 改成每轮都到期，这条即以 60+ 条失败**），见第 12.19 节 |
+| `--watch` 单人可读输出（离线） | `watch_line` 直接单测：六个关节的转角与 `+6.1f` 对齐、`out of pose` 点名列出的关节与容差、全部在容差内时写 `in the arm's pose, press a`、没帧时写 `waiting for the leader's first frame` 且**不打 J1**（打 0 会被读成"已经在姿态里"，是唯一错误答案）、ACTIVE/FAULT 只报状态与理由、没有 `distance()` 的解码器也能出一条行；PTY 里 `--watch` 真的打出**行**而不是 JSON（含 `J1`/`J6`、不含 `{`）、`a` 之前写 waiting、按 `a` 后下一行是 `ACTIVE ... armed at measured position`（成功 arm 会变 `state`，这条认不出节流退化；认得出的是 `PrintThrottleTests` 里"`state` 不变而 `reason` 变"那条）。见第 12.20 节 |
 | `fit` 的锚点（离线） | 夹具把 session 的 `continuous_deg` 整体挪一圈（`raw` 不变）后，写出的 map 仍能被新 `Mapper` 从 `raw` 复现出记录的臂角；**把这一行改回 `continuous_deg` 该测试即以 360.0 的差值失败**（三条测试同时失败），见第 12.16 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
@@ -1069,7 +1089,7 @@ def due_for_print(now, next_print, seen, state, reason):
 是常量（"armed at measured position"），只在 `stop()` / `_apply` 里改，所以不会退化成
 每轮都打。`grep` 一遍 `control.py` 确认 `self.reason` 的赋值点只有这两处。
 
-**验证**（离线，**261 项通过**）：
+**验证**（离线，当时 **261 项通过**；后续章节又加了测试）：
 - `tests/test_app.py::PrintThrottleTests`：未到间隔不打、到点打、`state` 变立刻打、
   **`state` 不变而 `reason` 变也立刻打**、同一条不重复打。
 - `tests/test_leader_integration.py::PrintRateTests`：PTY 里 `--print-rate 1` 跑约 2 s
@@ -1084,3 +1104,66 @@ def due_for_print(now, next_print, seen, state, reason):
 J2 `turns +360°`、残差 **+51.4°**（机械臂会走 −51.4°，J2 的 `sign` 是 −1），
 J5 `turns +360°`、残差 **+91.6°**（会走 +91.6°），最差关节 J5，`ok = false`
 ——即 30° 之下**仍然会被拒**，与 README 里的拒绝样例逐字一致。
+
+### 12.20 给人看的输出：`--watch` 行、拒绝信息里的读数、厂商横幅（2026-10-03）
+
+操作者实机跑了一晚，回来三件事挤在一起：(1) 屏幕上混着厂商 SDK 打的"ARX方舟无限"，
+(2) 默认的 JSON 记录在真机上是一面墙（第 12.19 节），(3) 他贴回来的拒绝信息里
+**J2 写的是 "reads -72.1"、"reads 438.8"**——而板子上此刻显示的数是 **287.9 / 78.8**。
+第三条是真 bug，不是观感。
+
+**（1）厂商横幅。** 厂商库从 C++ 直接写 fd 1，构造和析构各打一次
+（用户贴回来的样本正好前后各一行）。`VendorChatter` 本已在标定工具里做了 fd 层重定向，
+这次把它**从 `leader_calibrate.py` 挪到 `backends.py`**（两边都要用，两边又都 import
+厂商后端，放在 `app.py` 会成循环）。`run()` 用 `ExitStack` 进去、拿到 `dup` 出来的
+`stream`，程序自己的一切输出都写 `stream`；`stack.close()` 排在 `arm.close()` **之后**，
+SDK 的临别话也进日志。`app.py` 新增 `--arm-log`（默认 `teleop_arm.log`）。
+`tests/test_leader_calibrate.py::VendorChatterTests` 原样覆盖这个类，行为一字未改。
+
+**（2）`--watch`。** 新增 `--watch`（`watch_line()`），把每轮那条 JSON 换成一行：
+
+```
+01:28:38 STOPPED | J1   +0.0  J2  +35.1  J3   +0.0  J4   +0.0  J5 -129.1  J6   +0.0  | out of pose: J2 J5 (tolerance 30 deg)
+01:28:50 ACTIVE  | armed at measured position
+```
+
+数字来自新的 `LeaderUartDecoder.distance(arm_radians)`（只读，见第 6.1 节），**与门禁同一个
+`shortest_turn`**，所以这一行说 "in the arm's pose, press a" 的瞬间按 `a` 就是能成的
+（第 12.19 节的 `due_for_print` 保证答案当场打出来，不用等打印间隔）。
+没有 `distance()` 的解码器（`JsonLineDecoder`）退回只打状态，不报错。
+上面那段样例是**真跑出来的**（PTY + mock 臂 + 真 `app.py`），下面那条 out-of-pose 用的是
+操作者实测的那组数（把 mock 臂的零位对到 J2 323.0 / J5 309.7，让板子读 287.9 / 78.8）。
+
+**（3）拒绝信息里的读数。** `self.mapper.continuous` 是从**流开始那一刻**展开的，
+操作者把某个关节转过 0/360 之后它就是 `-72.1` 或 `438.8`；而 `needed` 是模一圈算的。
+两个不同基准的数并排写在同一句话里，读的人（正确）认为自己在读板子上的数——于是信息
+指着一个板上根本没有的数让人去对。修法：两边都 `% 360.0` 再打印：
+
+```python
+now = self.mapper.continuous[index] % 360.0
+needed = needed_deg[index] % 360.0
+```
+
+判决本身不受影响（残差是**距离**，与展开原点无关），改的只是给人看的字。
+`tests/test_leader_decoder.py::AnchorTests` 里加了一条用操作者**原样那组数**
+（J2 读 287.9、要 323.0；J5 读 78.8、要 309.7）断言信息里出现的是这两个数而不是
+`-72.1/438.8`——**把 `% 360.0` 去掉这条即以这些数失败**。
+
+**（4）顺带纠正一处文档错误。** 上一轮写下的"拒绝信息里两个数等大反号"是**错的**：
+`turn it` = `shortest_turn(needed, now)` = `−residual`，"会走" = `sign · residual`，
+两者**大小恒等**，符号在 `sign = −1` 时相同、`sign = +1` 时相反。真实那份 map 的方向是
+`+ − − − + −`，所以 J2（sign −1）两个数都是 −51.4，J5（sign +1）是 −91.6 / +91.6。
+README 与 HANDOFF 里的三处措辞按此改写。
+
+**验证**（离线，**277 项通过**，含真 pyserial + PTY）：
+- `tests/test_app.py::WatchLineTests`（6）、`PrintThrottleTests`（5）；
+- `tests/test_leader_decoder.py::AnchorTests` 里的 `distance()` 只读性、
+  走到姿态里归零、没帧返回 `None`、拒绝信息引用的是板上的数；
+- `tests/test_leader_integration.py::WatchModeTests`（5，`--watch` 跑真 `app.py`）
+  与 `PrintRateTests`（`--print-rate 1` 下记录数仍是个位数）。
+- 变异检验：去掉 `% 360.0` → 读数测试失败；把 `distance()` 改成写 `bias` →
+  "只在 `anchor()` 选圈"那条失败；`--watch` 打成 JSON → `WatchModeTests` 失败。
+- **PTY 测试的坑（踩过一次，记下来）**：往 pty master 写数据时若 app 还没 open slave，
+  这些字节会**丢掉**（写 master 得到 EIO）。harness 的 `wait_for(..., stream=...)` 每轮
+  重发一帧正是为此；手写的临时脚本只发一次，就会看到 "waiting for the leader's first
+  frame" 永远不消失——**那是脚本的问题，不是产品的**。

@@ -68,6 +68,7 @@ class LeaderHarness(unittest.TestCase):
     """
 
     PRINT_RATE = "100"
+    EXTRA_ARGS = ()
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -86,14 +87,17 @@ class LeaderHarness(unittest.TestCase):
             [sys.executable, "-u", str(APP), "--mode", "teleop", "--backend", "mock",
              "--serial", os.ttyname(self.slave), "--decoder", str(DECODER),
              "--leader-map", str(mapping), "--operator-keys", "--limits", str(limits),
-             "--rate", "100", "--print-rate", self.PRINT_RATE],
+             "--rate", "100", "--print-rate", self.PRINT_RATE, *self.EXTRA_ARGS],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment,
         )
         self.addCleanup(self.stop_process)
         self.buffer = b""
         self.records = []
-        self.wait_for(lambda r: r["state"] == "STOPPED")
+        self.lines = []
+        # Any line, whichever framing this mode prints: what is being waited for
+        # is that the readout has started, and the per-test waits do the rest.
+        self.wait_for_text("")
 
     def mapping_config(self):
         return mapping_from(REFERENCE)
@@ -124,6 +128,29 @@ class LeaderHarness(unittest.TestCase):
         """
         self.wait_for(lambda r: r.get("leader", {}).get("frame"), stream)
         self.press(b"a")
+
+    def wait_for_text(self, fragment, stream=b"", timeout=5):
+        """Wait for a raw line containing `fragment`, for the text readout.
+
+        The record waits above parse JSON, which --watch does not print; this
+        one only looks at the line, so it also serves as "wait for any output".
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                text = line.decode("utf-8", "replace")
+                self.lines.append(text)
+                if fragment in text:
+                    return text
+            if stream:
+                self.send(stream)
+            if select.select([self.process.stdout], [], [], 0.02)[0]:
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                if not chunk:
+                    self.fail(f"app exited early: {self.process.stderr.read().decode()}")
+                self.buffer += chunk
+        self.fail(f"No line matching {fragment!r}. Last lines: {self.lines[-3:]}")
 
     def wait_for(self, predicate, stream=b"", timeout=5):
         """Wait for a status line, re-sending `stream` each round when given.
@@ -299,6 +326,45 @@ class PrintRateTests(LeaderHarness):
         # control loop would have produced a couple of hundred.
         self.wait_for(lambda r: r.get("leader", {}).get("frames", 0) >= 60, CAPTURED)
         self.assertLess(len(self.records), 6)
+
+
+class WatchModeTests(LeaderHarness):
+    """``--watch`` prints the line a person reads instead of the JSON record.
+
+    It has to be the same measurement as the gate, or the operator would be
+    watching one number and refused by another.
+    """
+
+    EXTRA_ARGS = ("--watch",)
+
+    def test_the_readout_is_a_line_and_not_a_record(self):
+        line = self.wait_for_text("J1", CAPTURED)
+        self.assertRegex(line, r"^\d\d:\d\d:\d\d STOPPED")
+        self.assertNotIn("{", line)
+        self.assertIn("J6", line)
+
+    def test_it_says_when_pressing_a_would_work(self):
+        # The harness map puts the arm's rest pose at CAPTURED, so a leader in
+        # that pose reads as zero on every joint.
+        self.assertIn("in the arm's pose, press a",
+                      self.wait_for_text("in the arm's pose", CAPTURED))
+
+    def test_it_names_the_joints_that_are_out(self):
+        # J3 reads 196 where the arm's pose calls for 106: a quarter turn out,
+        # and the reason this line exists is to be watched on the way to zero.
+        away = b"795,3281,1960,2353,2875,2085,500"
+        line = self.wait_for_text("out of pose", away)
+        self.assertIn("J3", line)
+        self.assertIn("-90.0", line)
+
+    def test_before_a_frame_it_says_it_is_waiting(self):
+        self.assertIn("waiting for the leader's first frame", self.wait_for_text("waiting"))
+
+    def test_pressing_a_is_reported_on_the_following_line(self):
+        self.wait_for_text("in the arm's pose", CAPTURED)
+        self.press(b"a")
+        line = self.wait_for_text("ACTIVE", CAPTURED)
+        self.assertIn("armed at measured position", line)
 
 
 class RolloverTests(LeaderHarness):

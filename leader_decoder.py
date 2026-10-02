@@ -24,7 +24,7 @@ import re
 import time
 
 from leader_map import (
-    Mapper, load_mapping, resolve_mapping_path, shortest_turn,
+    ANCHOR_TOLERANCE_DEG, Mapper, load_mapping, resolve_mapping_path, shortest_turn,
 )
 from protocol import Command, ProtocolError
 
@@ -127,6 +127,30 @@ class LeaderUartDecoder:
             return None
         return self._anchor_refusal(verdict, needed_deg)
 
+    def distance(self, arm_radians):
+        """How far each joint has to be turned to be in the arm's pose, now.
+
+        The same shortest-side distance the refusal is phrased in, so what the
+        operator watches while moving the leader is the number the refusal will
+        quote, and it reaches zero exactly when arming becomes possible.
+
+        Read-only, deliberately: it must not choose the turn. That is `anchor`'s
+        job alone, once, at the moment the arm is enabled -- a bias written while
+        the leader is merely passing through would be carried into the session.
+
+        None until a frame has arrived, which is the one case with no answer.
+        """
+        if any(angle is None for angle in self.mapper.continuous):
+            return None
+        needed_deg = [joint.from_arm_deg(math.degrees(angle))
+                      for joint, angle in zip(self.mapping.joints, arm_radians)]
+        turns = [shortest_turn(needed, now)
+                 for now, needed in zip(self.mapper.continuous, needed_deg)]
+        return {"turn_deg": turns,
+                "outside": [index for index, turn in enumerate(turns)
+                            if abs(turn) > ANCHOR_TOLERANCE_DEG],
+                "tolerance_deg": ANCHOR_TOLERANCE_DEG}
+
     def _anchor_refusal(self, verdict, needed_deg):
         """Say which joints are not where the arm is, and how far to move them.
 
@@ -134,6 +158,12 @@ class LeaderUartDecoder:
         the physical move the hand has to make, and the command is what the arm
         would be told if it were armed anyway. They differ only in sign. Leading
         with the turn is what the operator can act on; see shortest_turn.
+
+        Both angles are given within one turn, which is the only way they can be
+        looked up: ``continuous`` unwraps from wherever the stream started, so a
+        joint the operator has turned past the rollover reads as -72.1 here
+        while the board says 287.9 -- and 287.9 is the number in front of them.
+        The verdict itself is unaffected, being a distance.
         """
         tolerance = verdict["tolerance_deg"]
         # Every joint that is out, not just the worst: they all have to be
@@ -142,10 +172,10 @@ class LeaderUartDecoder:
         for index, joint in enumerate(self.mapping.joints):
             if abs(verdict["residual_deg"][index]) <= tolerance:
                 continue
-            now = self.mapper.continuous[index]
-            needed = needed_deg[index]
+            now = self.mapper.continuous[index] % 360.0
+            needed = needed_deg[index] % 360.0
             away.append(f"J{index + 1} reads {now:.1f} deg where the arm's pose "
-                        f"calls for {needed % 360.0:.1f} "
+                        f"calls for {needed:.1f} "
                         f"(turn it {shortest_turn(needed, now):+.1f} deg)")
             moves.append(f"J{index + 1} {joint.sign * verdict['residual_deg'][index]:+.1f} deg")
         return ("the leader and the arm are not in the same pose: " + "; ".join(away) +

@@ -3,14 +3,65 @@
 import importlib.util
 from importlib.machinery import EXTENSION_SUFFIXES
 import math
+import os
 from pathlib import Path
 import socket
+import sys
 
 from protocol import vector6
 
 
 class UnsupportedStopMode(RuntimeError):
     pass
+
+
+class VendorChatter:
+    """Keep the vendor SDK's console output out of the operator's display.
+
+    The core library prints from C++ (it announces itself, and its destructor
+    announces the motors it releases), so redirecting ``sys.stdout`` would not
+    catch it: this moves the file descriptors instead. What it wrote is kept in a
+    log rather than discarded, since it is the only trace of what its threads did.
+
+    The caller writes its own output to the stream handed back, which is a
+    duplicate of the real descriptor -- anything printed through fd 1 while this
+    is open ends up in the log with the vendor's noise. It lives here rather than
+    in either tool because both of them drive the vendor library and both need the
+    operator's screen kept for their own status lines.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.console_fd = None
+        self.error_fd = None
+        self.console = None
+        self.log = None
+
+    def __enter__(self):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        self.log = open(self.path, "ab")
+        # Two separate duplicates: 1 and 2 are usually the same terminal, but
+        # restoring 2 from the duplicate of 1 would lose a redirected stderr.
+        self.console_fd = os.dup(1)
+        self.error_fd = os.dup(2)
+        self.console = open(self.console_fd, "w", buffering=1, encoding="utf-8")
+        os.dup2(self.log.fileno(), 1)
+        os.dup2(self.log.fileno(), 2)
+        return self.console
+
+    def __exit__(self, *exception):
+        try:
+            self.console.flush()
+        finally:
+            # Restore first, close second: the console object owns console_fd,
+            # and 1 and 2 are our own duplicates by the time they go.
+            os.dup2(self.console_fd, 1)
+            os.dup2(self.error_fd, 2)
+            self.console.close()
+            os.close(self.error_fd)
+            self.log.close()
+        return False
 
 
 class MockArm:
