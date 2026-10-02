@@ -106,6 +106,51 @@ class GripperProbeTests(unittest.TestCase):
             run(arguments(mode="probe-gripper", backend="sdk", model=None))
 
 
+class LimitsFileTests(unittest.TestCase):
+    """The gripper's two stops are a calibration, kept out of the joint envelope."""
+
+    def limits(self, directory, gripper):
+        config = dict(LIMITS)
+        if gripper is not None:
+            config["gripper"] = gripper
+        path = Path(directory) / "limits.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+    def test_the_section_is_lifted_out_of_the_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            limits, gripper = load_limits(self.limits(directory, {"open": 1.25, "closed": -0.5}))
+        self.assertEqual((gripper.open, gripper.closed), (1.25, -0.5))
+        self.assertEqual(list(limits.lower), LIMITS["lower"])
+        # The section must not have been passed on to Limits as a stray keyword.
+        self.assertFalse(hasattr(limits, "gripper"))
+
+    def test_no_section_means_the_gripper_is_off(self):
+        # The default, and the state every existing limits file is in: no key,
+        # no scale, and the write path is unreachable rather than defaulted.
+        with tempfile.TemporaryDirectory() as directory:
+            _, from_file = load_limits(limits_file(directory))
+            _, from_defaults = load_limits(None)
+        self.assertIsNone(from_file)
+        self.assertIsNone(from_defaults)
+
+    def test_a_malformed_section_is_refused_rather_than_guessed(self):
+        bad = ({"open": 1.0}, {"open": 1.0, "closed": 1.0}, {"open": 1.0, "close": 0.0},
+               {"open": "1.0", "closed": 0.0}, {"open": float("nan"), "closed": 0.0},
+               {"open": 1.0, "closed": 0.0, "extra": 1}, [1.0, 0.0], 1.0)
+        with tempfile.TemporaryDirectory() as directory:
+            for section in bad:
+                with self.subTest(section=section), self.assertRaises(ValueError):
+                    load_limits(self.limits(directory, section))
+
+    def test_a_bad_section_is_refused_before_any_arm_is_built(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("app.MockArm") as arm:
+                with self.assertRaises(ValueError):
+                    run(arguments(limits=self.limits(directory, {"open": 1.0})))
+            arm.assert_not_called()
+
+
 class AppTests(unittest.TestCase):
     def test_default_sdk_is_bundled_with_required_files(self):
         project = Path(__file__).resolve().parents[1]
@@ -300,6 +345,53 @@ class ArmCheckWiringTests(unittest.TestCase):
         self.assertIsNone(controller.pre_arm)
         controller.operator_arm(0)
         self.assertEqual(controller.state, "ACTIVE")
+
+
+class GripperEndToEndTests(unittest.TestCase):
+    """A whole mock run: the wire's gripper value reaches the arm, or does not."""
+
+    FRAMES = (b'{"v":1,"seq":1,"type":"arm","deadman":true}\n'
+              b'{"v":1,"seq":2,"type":"target","joints":[0,0,0,0,0,0],'
+              b'"deadman":true,"gripper":1.0}\n')
+
+    def teleop(self, directory, gripper):
+        config = dict(LIMITS)
+        if gripper is not None:
+            config["gripper"] = gripper
+        path = Path(directory) / "limits.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        arm = MockArm("soft")
+        source = Mock()
+        source.read.side_effect = [self.FRAMES] + [b""] * 100
+        output = io.StringIO()
+        with patch("app.SerialInput", return_value=source), \
+                patch("app.MockArm", return_value=arm), patch("sys.stdout", output):
+            code = run(arguments(limits=path, duration=0.05, print_rate=1000))
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+        return code, arm, records
+
+    def test_a_configured_run_drives_the_gripper_to_the_closed_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, arm, records = self.teleop(directory, {"open": 1.25, "closed": -0.5})
+        self.assertEqual(code, 0)
+        self.assertTrue(arm.gripper_writes)
+        self.assertEqual(set(arm.gripper_writes), {-0.5})  # Input was 1.0.
+        self.assertTrue(all("gripper" in record for record in records))
+        commanded = [record["gripper"] for record in records
+                     if record["gripper"]["command"] is not None]
+        self.assertTrue(commanded)
+        self.assertEqual(set(map(json.dumps, commanded)),
+                         {json.dumps({"input": 1.0, "command": -0.5})})
+        # The last line of a run is printed after the exit stop, so the command
+        # is gone by then while the input the operator is holding is still known.
+        self.assertEqual(records[-1]["gripper"], {"input": 1.0, "command": None})
+
+    def test_an_unconfigured_run_is_exactly_what_it_was_before(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, arm, records = self.teleop(directory, None)
+        self.assertEqual(code, 0)
+        self.assertEqual(arm.gripper_writes, [])
+        self.assertFalse(any("gripper" in record for record in records))
 
 
 class HardwareGateTests(unittest.TestCase):

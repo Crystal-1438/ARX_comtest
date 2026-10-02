@@ -284,6 +284,50 @@ class MatchedPoseTests(LeaderHarness):
         self.assertEqual(record["state"], "STOPPED")
 
 
+class GripperIntegrationTests(LeaderHarness):
+    """The seventh field, from the wire to the gripper command, on a real pty.
+
+    The mock arm is in another process here, so what proves the jaws moved is
+    the record: ``gripper.command`` is the value the loop wrote, and it is
+    checked against the two stops in the limits file. With CAPTURED's ADC of
+    500 the input is 0.5 and the command a quarter of the way from closed to
+    open: 1.25 + (-0.5 - 1.25) * 0.5.
+    """
+
+    LIMITS = dict(WIDE_LIMITS, gripper={"open": 1.25, "closed": -0.5})
+
+    def test_the_input_fraction_reaches_the_arm_as_an_interpolated_command(self):
+        self.press_arm()
+        record = self.wait_for(lambda r: r.get("gripper", {}).get("command") is not None,
+                               CAPTURED)
+        self.assertEqual(record["state"], "ACTIVE")
+        self.assertAlmostEqual(record["gripper"]["input"], 0.5)
+        self.assertAlmostEqual(record["gripper"]["command"], 0.375)
+        # Both units in the same record, which is the point of keeping them
+        # under two names: the board sent 500, the arm was told 0.375.
+        self.assertEqual(record["leader"]["frame"]["gripper"], 500)
+
+    def test_the_jaws_follow_the_hand_to_the_open_end(self):
+        self.press_arm()
+        self.wait_for(lambda r: r.get("gripper", {}).get("command") is not None, CAPTURED)
+        released = b"795,3281,1060,2353,2875,2085,0"
+        record = self.wait_for(lambda r: r.get("gripper", {}).get("input") == 0.0, released)
+        self.assertAlmostEqual(record["gripper"]["command"], 1.25)
+
+
+class UnconfiguredGripperTests(LeaderHarness):
+    """No gripper section in the limits file: nothing about one is recorded."""
+
+    def test_no_record_of_the_run_mentions_a_gripper(self):
+        self.press_arm()
+        self.wait_for(lambda r: r["state"] == "ACTIVE", CAPTURED)
+        # Keep the run going for a while so the check covers more than the
+        # first line, and check every line that was parsed.
+        moving = b"800,3281,1060,2353,2875,2085,0"
+        self.wait_for(lambda r: r["joints_rad"][0] < 0, moving)
+        self.assertTrue(all("gripper" not in record for record in self.records))
+
+
 class MismatchedPoseTests(LeaderHarness):
     """Same map, but the leader is a quarter turn away from where the arm is."""
 

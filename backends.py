@@ -64,6 +64,19 @@ class VendorChatter:
         return False
 
 
+def _gripper_value(value):
+    """The one gripper command both arms accept: a finite number, or nothing.
+
+    Strings are not coerced even though ``float()`` would take them: the value
+    comes out of an interpolation, so anything else is a caller's bug, and a
+    quiet conversion here would be the only place in this project that turns a
+    wrong type into a motor command. ``bool`` is out for the same reason.
+    """
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError("gripper command must be a finite number")
+    return float(value)
+
+
 class MockArm:
     """Instantaneous simulation for I/O tests, not a dynamics or safety validation."""
 
@@ -73,6 +86,11 @@ class MockArm:
         self.gripper = 0.0
         self.active = False
         self.writes = []
+        # Gripper commands are kept apart from joint writes on purpose: almost
+        # every test in the suite reads ``writes`` to mean "the six joints the
+        # loop sent", and mixing a scalar in would either break those or need
+        # them all to learn to skip it.
+        self.gripper_writes = []
 
     def stop(self):
         self.active = False
@@ -94,6 +112,14 @@ class MockArm:
         self.writes.append(self.positions)
         # Keep long-running mock sessions bounded.
         del self.writes[:-1000]
+
+    def write_gripper(self, value):
+        if not self.active:
+            raise RuntimeError("gripper write while stopped")
+        value = _gripper_value(value)
+        self.gripper = value
+        self.gripper_writes.append(value)
+        del self.gripper_writes[:-1000]
 
     def close(self):
         self.stop()
@@ -227,6 +253,23 @@ class VendorArm:
         if not self.active:
             raise RuntimeError("write while stopped")
         self._check(self.interface.set_joint_positions(list(vector6(positions))), "joint target")
+
+    def write_gripper(self, value):
+        """Command the gripper, in the same unit ``read_gripper`` reports.
+
+        That the two units agree is an assumption, not a measurement -- it is
+        what ``start()`` has always done, writing the feedback value straight
+        back, and neither the header nor the URDF nor the binary says what
+        ``set_catch`` expects. The two-stop probe observes the read side only.
+        If the jaws go somewhere unexpected, or the SDK rejects the value, this
+        is the first assumption to check.
+
+        Only ever called while tracking a target: nothing on the stop path may
+        reach it, so a SOFT stop cannot move the gripper.
+        """
+        if not self.active:
+            raise RuntimeError("gripper write while stopped")
+        self._check(self.interface.set_catch(_gripper_value(value)), "gripper target")
 
     def close(self):
         # Public SDK has no acknowledged disable/close. Stop and let process exit reap threads.

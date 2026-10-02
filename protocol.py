@@ -27,6 +27,12 @@ class Command:
     seq: int
     joints: tuple = ()
     deadman: bool = False
+    # The teleoperation input for the gripper, normalized: 0.0 fully open, 1.0
+    # fully closed. Deliberately not the number the leader's frame carries --
+    # that one is a raw ADC and the decoder's telemetry keeps it under
+    # "gripper". None means the sender has no gripper channel, which is inert:
+    # nothing is sent to the arm's gripper at all.
+    gripper_input: float = None
 
     def validate(self):
         if self.kind not in ("stop", "arm", "target"):
@@ -39,6 +45,14 @@ class Command:
             vector6(self.joints)
         elif self.joints:
             raise ProtocolError("only target commands may contain joints")
+        if self.gripper_input is not None:
+            if self.kind != "target":
+                raise ProtocolError("only target commands may contain a gripper value")
+            if (type(self.gripper_input) not in (int, float)
+                    or not math.isfinite(self.gripper_input)):
+                raise ProtocolError("gripper must be a finite number (0 open, 1 closed)")
+            if not 0.0 <= self.gripper_input <= 1.0:
+                raise ProtocolError("gripper must be within 0..1 (0 fully open, 1 closed)")
         return self
 
 
@@ -72,7 +86,7 @@ class JsonLineDecoder:
                 obj = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_keys)
                 if not isinstance(obj, dict):
                     raise ProtocolError("frame must be an object")
-                if set(obj) - {"v", "seq", "type", "joints", "deadman"}:
+                if set(obj) - {"v", "seq", "type", "joints", "deadman", "gripper"}:
                     raise ProtocolError("unknown frame fields")
                 if type(obj.get("v")) is not int or obj["v"] != 1:
                     raise ProtocolError("expected protocol v=1")
@@ -80,6 +94,7 @@ class JsonLineDecoder:
                     obj.get("type"), obj.get("seq"),
                     vector6(obj["joints"]) if "joints" in obj else (),
                     obj.get("deadman", False),
+                    obj.get("gripper"),
                 ).validate())
             if len(self.buffer) > self.max_frame_bytes:
                 raise ProtocolError("unterminated frame too long")

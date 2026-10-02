@@ -14,7 +14,7 @@ import sys
 import time
 
 from backends import MockArm, VendorArm, VendorChatter, extension_path, load_sdk
-from control import Controller, Limits
+from control import Controller, GripperScale, Limits
 from operator_keys import KeyInput, NullInput
 from protocol import JsonLineDecoder, ProtocolError
 
@@ -83,13 +83,40 @@ def decoder_from_path(path):
 
 
 def load_limits(path, hardware=False):
+    """The joint envelope, and the gripper calibration if the file carries one.
+
+    Returns ``(Limits, GripperScale or None)``. The ``gripper`` key is lifted out
+    before ``Limits`` is built: the two are different kinds of number -- one is
+    the envelope that decides whether the arm may be enabled at all, the other a
+    pair of measured stops -- and feeding one dict into one dataclass is exactly
+    how the next reader ends up unable to tell them apart.
+
+    No key means the gripper is not configured, and the whole write path is then
+    unreachable. There is no default pair to fall back on: the stops can only be
+    measured on the arm (``--mode probe-gripper``), so anything invented here
+    would be a guess with a motor on the other end of it. A malformed pair raises
+    on the spot, before any arm is constructed.
+    """
     if not path:
         if hardware:
             raise ValueError("SDK teleop requires --limits with calibrated joint limits in radians")
-        return Limits((-1.0,) * 6, (1.0,) * 6)
+        return Limits((-1.0,) * 6, (1.0,) * 6), None
     with open(path, encoding="utf-8") as stream:
         config = json.load(stream)
-    return Limits(**config)
+    gripper = None
+    if isinstance(config, dict) and "gripper" in config:
+        config = dict(config)
+        # Strict on both the shape and the key names: a misspelled endpoint that
+        # is quietly ignored would leave the scale built from a default that does
+        # not exist, or worse, from a stale one.
+        section = config.pop("gripper")
+        if not isinstance(section, dict) or set(section) != {"open", "closed"}:
+            raise ValueError('the "gripper" section needs exactly "open" and "closed"')
+        try:
+            gripper = GripperScale(section["open"], section["closed"])
+        except ValueError as exc:
+            raise ValueError(f"gripper: {exc}") from exc
+    return Limits(**config), gripper
 
 
 def preflight(args):
@@ -342,6 +369,15 @@ def emit(controller, joints, backend, decoder=None, stream=None):
         "joints_deg": [round(math.degrees(q), 4) for q in joints],
         "host_read_monotonic": time.monotonic(),
     }
+    # Present only once the gripper is configured, so an unconfigured setup
+    # records exactly what it recorded before. "input" is the normalized leader
+    # value and is null until a frame carrying one arrives, which is how a
+    # configured-but-silent channel shows up; "command" is the arm value last
+    # written, and stays null until the loop is ACTIVE. Neither is in the
+    # decoder's own units -- the raw ADC stays under leader.frame.gripper.
+    if controller.gripper is not None:
+        record["gripper"] = {"input": controller.gripper_input,
+                             "command": controller.gripper_command}
     # What the decoder last made of its input. joints_deg above is arm feedback,
     # so while nothing is armed this is the only way to watch a live stream.
     telemetry = getattr(decoder, "last_telemetry", None)
@@ -364,7 +400,7 @@ def run(args):
         raise ValueError("teleop requires --serial (or --demo with mock)")
     if args.operator_keys and args.mode != "teleop":
         raise ValueError("--operator-keys only applies to teleop")
-    limits = load_limits(args.limits, hardware and args.mode == "teleop")
+    limits, gripper = load_limits(args.limits, hardware and args.mode == "teleop")
     if 1 / args.rate >= limits.timeout:
         raise ValueError("control period must be shorter than command timeout")
     if args.leader_map:
@@ -401,7 +437,7 @@ def run(args):
             stream = stack.enter_context(VendorChatter(args.arm_log))
         arm = (VendorArm(args.sdk_root, args.can_port, args.model, args.stop_mode)
                if hardware else MockArm(args.stop_mode))
-        controller = Controller(arm, limits, time.monotonic())
+        controller = Controller(arm, limits, time.monotonic(), gripper=gripper)
         install_arm_check(controller, decoder)
         started = time.monotonic()
         next_tick = next_print = started

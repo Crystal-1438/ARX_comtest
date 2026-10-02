@@ -303,7 +303,12 @@ class LeaderUartDecoder:
             return []
         self.seq += 1
         self._publish(newest)
-        return [Command("target", self.seq, newest[1], True)]
+        # The seventh field is the input the gripper follows, normalized here
+        # because that is the only place that knows it arrived as an ADC out of
+        # 1000. Zero is the open end, which is what the mapping is defined
+        # against; the raw field stays under "gripper" in the telemetry above.
+        return [Command("target", self.seq, newest[1], True,
+                        newest[0][JOINTS] / GRIPPER_MAX)]
 
 
 def create_decoder():

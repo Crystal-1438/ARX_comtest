@@ -69,10 +69,48 @@ class Limits:
         return clamped, saturated
 
 
+@dataclass(frozen=True)
+class GripperScale:
+    """Where the gripper's two stops are, in the unit the arm reports them in.
+
+    A measurement rather than a limit. It is read off the arm with
+    ``app.py --mode probe-gripper`` because the SDK documents no unit for
+    ``set_catch`` and no range for channel 7, and it is kept out of ``Limits``
+    for that reason: `Limits` is the envelope that decides whether the arm may
+    be enabled, and these two numbers are a calibration. Mixed together, the
+    next reader cannot tell which of them is a safety bound.
+
+    The pair may be in either order -- which end is larger is a property of the
+    gripper, not something to validate against -- but they may not be equal,
+    which is what a failed measurement looks like.
+    """
+
+    open: float
+    closed: float
+
+    def __post_init__(self):
+        for name, value in (("open", self.open), ("closed", self.closed)):
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f"gripper {name} must be a finite number")
+        if self.open == self.closed:
+            raise ValueError("gripper open and closed differ, or the reading failed")
+
+    def value(self, input_fraction):
+        """The arm command for a normalized input: 0 fully open, 1 fully closed."""
+        fraction = min(max(float(input_fraction), 0.0), 1.0)
+        return self.open + (self.closed - self.open) * fraction
+
+
 class Controller:
-    def __init__(self, arm, limits, now):
+    def __init__(self, arm, limits, now, gripper=None):
         self.arm = arm
         self.limits = limits
+        # None means the operator has not configured the two stops, and the
+        # whole gripper path is then unreachable -- there is no default to fall
+        # back on, deliberately, because the only safe default is "send nothing".
+        self.gripper = gripper
+        self.gripper_input = None
+        self.gripper_command = None
         self.state = "STOPPED"
         self.reason = "startup"
         self.last_seq = -1
@@ -109,12 +147,24 @@ class Controller:
         # Nothing is being held at a bound once there is no command at all, and
         # a stale list would be read as one by whoever prints the state.
         self.saturated = []
+        # The gripper command goes with the joints -- it was the output for an
+        # input that is no longer being followed. ``gripper_input`` deliberately
+        # stays: re-arming follows what the operator is holding now, and the
+        # input is not a command this loop has sent.
+        self.gripper_command = None
         self.arm.stop()
 
-    def _apply(self, kind, joints, now):
+    def _apply(self, kind, joints, now, gripper=None):
         """State transitions shared by the wire path and the local operator path."""
         if self.state == "FAULT":
             return  # Explicit STOP followed by ARM is required after a fault.
+        if kind == "target" and gripper is not None:
+            # Recorded whether or not anything is armed. Only the value is kept,
+            # not the intent to send it: writing is gated below on ACTIVE and on
+            # a configured scale, so a target arriving while stopped leaves the
+            # gripper alone entirely -- but arming then follows the input the
+            # operator is already holding instead of waiting for the next frame.
+            self.gripper_input = gripper
         if kind == "arm":
             if self.state != "STOPPED":
                 return  # Repeated ARM frames cannot refresh the target watchdog.
@@ -166,7 +216,7 @@ class Controller:
         if not command.deadman:
             self.stop("deadman released")
             return
-        self._apply(command.kind, command.joints, now)
+        self._apply(command.kind, command.joints, now, command.gripper_input)
 
     def operator_stop(self, reason="operator stop"):
         """Local STOP. Clears a latched FAULT, and never touches the wire sequence."""
@@ -231,4 +281,34 @@ class Controller:
                 dt,
                 math.degrees(self.limits.max_speed)))
         self.arm.write_joints(self.commanded)
+        self._follow_gripper()
         return feedback
+
+    def _follow_gripper(self):
+        """Send the gripper to where the input asks, or latch a fault.
+
+        Only reachable while ACTIVE, and only with both a configured scale and
+        an input to act on; with either missing this does nothing at all rather
+        than reaching for a default, which is what keeps an unconfigured setup
+        from touching the gripper.
+
+        The interpolation is sent as it comes out. No rate limit and no tracking
+        differentiator: those are six-dimensional and in degrees, and the vendor's
+        own layer clamps the gripper's approach anyway. Worth knowing: a gripper
+        command has no trajectory behind it, so a fast hand on the leader is a
+        fast move on the jaws.
+
+        A rejected write faults instead of raising. This runs outside the loop's
+        decoder guard, so an exception would leave by way of main() with no state
+        on the screen and no way to press stop -- the same trap the following
+        error above faults to avoid.
+        """
+        if self.gripper is None or self.gripper_input is None:
+            return
+        value = self.gripper.value(self.gripper_input)
+        try:
+            self.arm.write_gripper(value)
+        except (OSError, RuntimeError, ValueError, TypeError) as exc:
+            self.stop(f"gripper command rejected: {exc}", fault=True)
+            return
+        self.gripper_command = value

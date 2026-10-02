@@ -40,6 +40,40 @@ class VendorAdapterTests(unittest.TestCase):
         self.assertEqual(self.arm.interface.method_calls[0][0], "get_joint_positions")
         self.assertEqual(len(self.arm.interface.method_calls), 1)  # No set_catch.
 
+    def test_write_gripper_is_set_catch_and_only_while_tracking(self):
+        with self.assertRaises(RuntimeError):
+            self.arm.write_gripper(0.5)
+        self.arm.interface.set_catch.assert_not_called()
+        self.arm.active = True
+        self.arm.write_gripper(0.5)
+        self.arm.interface.set_catch.assert_called_once_with(0.5)
+
+    def test_nothing_but_a_finite_number_reaches_the_sdk(self):
+        # No coercion: "0.5" and True are refused rather than converted, because
+        # the command is produced by an interpolation and anything else is a bug
+        # upstream of the motor.
+        self.arm.active = True
+        for value in (float("nan"), float("inf"), "0.5", True, None, [0.5]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.arm.write_gripper(value)
+        self.arm.interface.set_catch.assert_not_called()
+
+    def test_a_rejected_gripper_target_raises(self):
+        self.arm.active = True
+        self.arm.interface.set_catch.return_value = False
+        with self.assertRaises(RuntimeError):
+            self.arm.write_gripper(0.5)
+
+    def test_the_stop_path_never_touches_the_gripper(self):
+        # STOP, close and SOFT are the paths a fault takes. None of them may
+        # move the jaws -- nothing here knows whether SOFT holds or releases
+        # them, so the only safe thing is not to send anything.
+        self.arm.active = True
+        self.arm.stop()
+        self.arm.close()
+        self.arm.enable_gravity_compensation()
+        self.arm.interface.set_catch.assert_not_called()
+
     def test_failed_target_does_not_enter_position_mode(self):
         self.arm.interface.set_joint_positions.return_value = False
         with self.assertRaises(RuntimeError):

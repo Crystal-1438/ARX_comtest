@@ -156,6 +156,40 @@ class DecoderTests(unittest.TestCase):
         self.assertAlmostEqual(decoder.last_telemetry["frame"]["angle_deg"][1], 328.1)
 
 
+class GripperInputTests(unittest.TestCase):
+    """The seventh field is the input the gripper follows, normalized on the way
+    out because this is the only place that knows it arrived as an ADC."""
+
+    def decoder(self):
+        return LeaderUartDecoder(calibrated())
+
+    def frame(self, adc):
+        return VALID.rsplit(b",", 1)[0] + b"," + str(adc).encode()
+
+    def test_the_input_is_the_seventh_field_over_its_full_scale(self):
+        for adc, expected in ((0, 0.0), (250, 0.25), (500, 0.5), (1000, 1.0)):
+            with self.subTest(adc=adc):
+                command = feed(self.decoder(), self.frame(adc))[0]
+                self.assertAlmostEqual(command.gripper_input, expected)
+
+    def test_the_telemetry_keeps_the_raw_adc(self):
+        # The two are different quantities and the record carries both:
+        # "gripper" is what the board sent, gripper_input is the fraction the
+        # arm is asked to follow. Only the second one belongs anywhere near
+        # set_catch, and nothing should ever "unify" them.
+        decoder = self.decoder()
+        feed(decoder, self.frame(750))
+        self.assertEqual(decoder.last_telemetry["frame"]["gripper"], 750)
+        self.assertAlmostEqual(decoder.last_frame["gripper"], 750)
+
+    def test_a_dropped_warmup_frame_carries_no_input_either(self):
+        # The whole frame goes, so the jaws cannot be moved by a packet that
+        # was not good enough to move the arm.
+        decoder = self.decoder()
+        self.assertEqual(feed(decoder, b"-1,3281,1060,2353,2875,2085,900"), [])
+        self.assertIsNone(decoder.last_frame)
+
+
 class StartupTransientTests(unittest.TestCase):
     """docs/uart_packet.md section 4: the first packets after a board reset may
     still read -1 while the encoder waits for its first PWM period."""

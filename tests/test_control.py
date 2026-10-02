@@ -1,8 +1,9 @@
 import math
 import unittest
+from unittest.mock import Mock
 
 from backends import MockArm, VendorArm, UnsupportedStopMode
-from control import Controller, Limits
+from control import Controller, GripperScale, Limits
 from protocol import Command, JsonLineDecoder, ProtocolError
 
 
@@ -27,6 +28,33 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             decoder.feed(b'x' * 65)
         self.assertEqual(decoder.feed(b'{"v":1,"seq":1,"type":"stop"}\n')[0].kind, "stop")
+
+    def test_the_gripper_input_rides_along_with_a_target(self):
+        frame = JsonLineDecoder().feed(
+            b'{"v":1,"seq":1,"type":"target","joints":[0,0,0,0,0,0],"gripper":0.25}\n')[0]
+        self.assertEqual(frame.gripper_input, 0.25)
+        self.assertEqual(frame.joints, (0.0,) * 6)
+
+    def test_the_gripper_field_defaults_to_no_channel_at_all(self):
+        # Positional callers predate this field, and a sender with no gripper
+        # channel must keep meaning exactly what it meant before.
+        self.assertIsNone(Command("stop", 1).gripper_input)
+        self.assertEqual(Command("target", 1, (0.0,) * 6, True),
+                         Command("target", 1, (0.0,) * 6, True, None))
+
+    def test_the_gripper_input_must_be_a_fraction_of_travel(self):
+        # NaN is the one that has to be named: it is a float, so only the
+        # finiteness test catches it, and every comparison against it is False.
+        for value in (b'-0.1', b'1.1', b'"0.5"', b'true', b'[0.5]', b'NaN', b'Infinity'):
+            with self.subTest(value=value), self.assertRaises(ProtocolError):
+                JsonLineDecoder().feed(
+                    b'{"v":1,"seq":1,"type":"target","joints":[0,0,0,0,0,0],'
+                    b'"gripper":' + value + b'}\n')
+
+    def test_only_a_target_may_carry_a_gripper_input(self):
+        for kind in (b'"arm"', b'"stop"'):
+            with self.subTest(kind=kind), self.assertRaises(ProtocolError):
+                JsonLineDecoder().feed(b'{"v":1,"seq":1,"type":' + kind + b',"gripper":0.5}\n')
 
 
 class ControlTests(unittest.TestCase):
@@ -382,6 +410,123 @@ class OperatorChannelTests(unittest.TestCase):
     def test_local_stop_reports_why(self):
         self.control.operator_stop("panel button")
         self.assertEqual((self.control.state, self.control.reason), ("STOPPED", "panel button"))
+
+
+class GripperScaleTests(unittest.TestCase):
+    def test_the_two_stops_must_differ_and_be_finite(self):
+        for pair in ((1.0, 1.0), (float("nan"), 0.0), (0.0, float("inf")),
+                     (0.0, float("-inf")), ("0", 1.0), (True, False), (0.0, None)):
+            with self.subTest(pair=pair), self.assertRaises(ValueError):
+                GripperScale(*pair)
+
+    def test_the_interpolation_clamps_and_does_not_assume_an_order(self):
+        # Which end reads larger is a property of the gripper, not something to
+        # validate: this one is closed at the smaller number.
+        scale = GripperScale(open=2.0, closed=-1.5)
+        self.assertEqual(scale.value(0.0), 2.0)
+        self.assertEqual(scale.value(1.0), -1.5)
+        self.assertEqual(scale.value(0.5), 0.25)
+        self.assertEqual(scale.value(-3.0), 2.0)
+        self.assertEqual(scale.value(7.0), -1.5)
+
+
+class GripperFollowTests(unittest.TestCase):
+    """The jaws follow the operator's input, and nothing else moves them."""
+
+    def setUp(self):
+        self.arm = MockArm()
+        # Distinctive stops, neither of them 0 or 1: an interpolation that
+        # forgot the span, or swapped the ends, cannot look right by accident.
+        self.scale = GripperScale(open=-1.5, closed=2.0)
+        self.control = Controller(self.arm, Limits((-1,) * 6, (1,) * 6), 0,
+                                  gripper=self.scale)
+        self.seq = 0
+
+    def send(self, kind, now, gripper=None, deadman=True):
+        self.seq += 1
+        joints = (0.0,) * 6 if kind == "target" else ()
+        self.control.handle(Command(kind, self.seq, joints, deadman, gripper), now)
+
+    def follow(self, value, now):
+        self.send("target", now, gripper=value)
+        self.control.tick(now)
+
+    def test_zero_opens_and_one_closes(self):
+        self.send("arm", 0.0)
+        for value in (0.0, 0.5, 1.0, 0.25):
+            with self.subTest(value=value):
+                self.follow(value, 0.01 * (self.seq + 1))
+                self.assertAlmostEqual(self.arm.gripper_writes[-1], self.scale.value(value))
+
+    def test_a_target_while_stopped_is_remembered_not_sent(self):
+        # The operator's choice: arming follows the input already in hand rather
+        # than waiting for the next frame. Nothing moves before the arm is on.
+        self.send("target", 0.01, gripper=0.75)
+        self.assertEqual(self.arm.gripper_writes, [])
+        self.assertEqual(self.control.gripper_input, 0.75)
+        self.send("arm", 0.02)
+        self.control.tick(0.03)
+        self.assertEqual(self.arm.gripper_writes, [self.scale.value(0.75)])
+
+    def test_the_deadman_release_stops_the_gripper_too(self):
+        self.send("arm", 0.0)
+        self.follow(1.0, 0.01)
+        before = list(self.arm.gripper_writes)
+        self.send("target", 0.02, gripper=0.0, deadman=False)
+        self.control.tick(0.03)
+        self.assertEqual(self.control.state, "STOPPED")
+        self.assertEqual(self.arm.gripper_writes, before)
+        self.assertIsNone(self.control.gripper_command)
+
+    def test_a_timeout_fault_stops_the_gripper_too(self):
+        self.send("arm", 0.0)
+        self.follow(1.0, 0.01)
+        before = list(self.arm.gripper_writes)
+        self.control.tick(1.0)  # Past limits.timeout, with no command since.
+        self.assertEqual(self.control.state, "FAULT")
+        self.assertEqual(self.arm.gripper_writes, before)
+
+    def test_re_arming_follows_the_input_held_now(self):
+        self.send("arm", 0.0)
+        self.follow(1.0, 0.01)
+        self.control.operator_stop()
+        self.send("target", 0.02, gripper=0.25)  # Arrives while stopped.
+        self.assertEqual(len(self.arm.gripper_writes), 1)
+        self.send("arm", 0.03)
+        self.control.tick(0.04)
+        # Not the 1.0 that was commanded before the stop: the input is what the
+        # operator is holding, and it is the thing being followed.
+        self.assertEqual(self.arm.gripper_writes[-1], self.scale.value(0.25))
+
+    def test_an_unconfigured_gripper_is_never_written(self):
+        self.control = Controller(self.arm, Limits((-1,) * 6, (1,) * 6), 0)
+        self.send("arm", 0.0)
+        self.follow(1.0, 0.01)
+        self.assertEqual(self.arm.gripper_writes, [])
+
+    def test_a_rejected_command_faults_instead_of_leaving_tick(self):
+        self.send("arm", 0.0)
+        self.arm.write_gripper = Mock(side_effect=RuntimeError("SDK rejected gripper target"))
+        self.follow(1.0, 0.01)  # Must not raise: tick() is outside the loop's guard.
+        self.assertEqual(self.control.state, "FAULT")
+        self.assertIn("gripper command rejected", self.control.reason)
+        self.assertIsNone(self.control.gripper_command)
+
+
+class JammingGripperTests(unittest.TestCase):
+    """A gripper that lags is not a tracking failure, whatever the jaws do."""
+
+    def test_the_following_error_check_is_six_joints_wide(self):
+        arm = MockArm()
+        arm.write_gripper = lambda value: arm.gripper_writes.append(value)  # Never moves.
+        control = Controller(arm, Limits((-1,) * 6, (1,) * 6), 0,
+                             gripper=GripperScale(open=-1.5, closed=2.0))
+        control.handle(Command("arm", 1, deadman=True), 0)
+        for step in range(2, 40):
+            control.handle(Command("target", step, (0.4,) * 6, True, 1.0), 0.01 * step)
+            control.tick(0.01 * step)
+        self.assertEqual(control.state, "ACTIVE")
+        self.assertEqual(arm.gripper_writes[-1], 2.0)
 
 
 if __name__ == "__main__":
