@@ -109,7 +109,7 @@ sha256sum -c SHA256SUMS
 | 0 | SOFT | 停止、故障、退出时请求零力矩 |
 | 1 | GO_HOME | 不调用 |
 | 2 | PROTECT | 不冒充失能，不作为当前停止实现 |
-| 3 | G_COMPENSATION | 不作为停止实现 |
+| 3 | G_COMPENSATION | 只给 `leader_calibrate.py --arm` 标定时托住机械臂；退出前确认后回 SOFT |
 | 4 | END_CONTROL | 当前未做笛卡尔控制 |
 | 5 | POSITION_CONTROL | 正常六关节绝对位置控制 |
 
@@ -124,6 +124,13 @@ sha256sum -c SHA256SUMS
 **边界**：SDK 构造会启动线程，可能使能电机。公开 Python 接口没有明确电机失能、
 关闭线程、停止确认、反馈时间戳或通信 watchdog。SOFT 无重力支撑，机械臂会下落；
 异常清理只能尽力请求 SOFT，不能保证 SIGKILL、SDK 卡住或 CAN 断开后的硬件行为。
+
+重力补偿（状态 3）也不是失能：它按 URDF 动力学主动出力托住机械臂，是**驱动**状态。
+负载、夹爪或型号不在 URDF 里，算出的力矩就会有偏差，机械臂会缓慢漂移而不是稳稳悬停——
+**真机上一次都没跑过**（见 §12.10），进入前必须有支撑、有人在旁边。本项目没有外部急停。
+已确认可达：头文件里的 `InterfacesPy::gravity_compensation()` 既没进 pybind 也没导出到 `.so`，
+但 `set_arm_status` 已绑定，`.rodata:0x32040` 的跳转表把它映射到 `stateGravityCompensation`，
+厂商自己的 `bimanual/script/single_arm.py:117` 用的也是 `set_arm_status(3)`。
 
 ## 6. 串口契约与状态机
 
@@ -194,9 +201,26 @@ decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` �
 ### 6.2 标定工具（`leader_calibrate.py`）
 
 `session` 交互式逐姿态采集（采集时机由操作者按键决定），`sample` 采一个姿态，
-`fit` 把若干姿态拟合成 `leader_map.json`。**只读**：不 arm、
-不发 target；`--arm` 会构造 `InterfacesPy`（厂商线程、构造自己会进 SOFT），
-但只调 `read_joints()`，读完立即 `close()`；不加 `--arm` 则完全不碰 CAN、不加载厂商库。
+`fit` 把若干姿态拟合成 `leader_map.json`。**不 arm、不发 target**；`--arm` 会构造
+`InterfacesPy`（厂商线程、构造先落 SOFT），然后**进重力补偿（状态 3）让机械臂托住自己**，
+只调 `read_joints()`；不加 `--arm` 则完全不碰 CAN、不加载厂商库。
+
+**`--arm` 是通电操作，不再是只读**：状态 3 是电机驱动（不是失能），退出前必须回到 SOFT。
+两个子命令都自己保证这一点：
+
+- `session`（有终端）：会话结束后**先问再松手**。`confirm_release()` 打印"机械臂仍在重力补偿，
+  正托着自己"，读到回车/空格/`y`/`g` 才 `stop()` 回 SOFT；stdin 关闭（没人可问）也回 SOFT。
+  这样既不会在操作者还在打字时突然掉落，也不会让进程退出后机械臂留在状态 3 无人驱动 CAN。
+- `sample`（无终端）：没地方问，读完直接回 SOFT 并打印说明。
+- **Ctrl+C / Ctrl+D 例外**：中断就是"现在要停"，因此 `run()` 不再吞 `KeyboardInterrupt`
+  （只保留 `finally` 存盘），异常直接穿到 `main()` 返回 130，跳过确认提示；
+  `finally` 里的 `close()` 仍会回 SOFT 并打印一行，操作者要准备好扶住机械臂。
+- **SIGTERM 走同一条路**：Python 只把 SIGINT 转成 `KeyboardInterrupt`，SIGTERM 默认直接终止进程，
+  `finally` 链根本不会跑——那会让机械臂停在驱动状态而进程已消失。`sample`/`session` 用
+  `@treat_sigterm_as_interrupt` 装饰，把 SIGTERM 也抛成 `KeyboardInterrupt`，代价是终止时退出码也是 130。
+  `fit` 不装饰：它不碰机械臂。
+- `enable_gravity_compensation()` 只在 `active=False` 时可用（绝不在跟踪目标时切模式），
+  失败时抛 `RuntimeError`；`close()` 无条件回到 SOFT，是最后的兜底。
 
 `session` 与前两者的差别只在生命周期：SDK 起停很贵，操作者又要边摆边看角度，
 所以一个进程里把两侧一直开着，用**最近 `--window` 秒（默认 1.5 s）的滚动窗口**当作"当前姿态"，
@@ -267,7 +291,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 163 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 175 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -275,6 +299,9 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | 交互式标定测试 | 注入伪 source/arm/keys/clock：滚动窗口只含当前姿态、撤销、未动够的关节被点名、`f` 失败留在循环里、整圈跑完写出可加载的 map、提前 `q` 以退出码 2 结束且留下的姿态能被 `fit` 直接使用 |
 | `session` 端到端（PTY 终端 + PTY 串口，无 SDK） | 真按键 → 真串口 → 采集 1 个姿态、退出码 2、arm.log 为空（未加载厂商库） |
 | `VendorChatter` fd 重定向 | fd 1/2 都进日志、退出后两个 fd 都回到原目标（分别 dup，不共用副本） |
+| 重力补偿接线（离线，无硬件） | `set_arm_status(3)` 恰好一次、跟踪目标时拒绝切模式、`close()` 后最后一条是 SOFT；`--arm` 的构造→进 3→读→`close()` 顺序；`confirm_release` 确认才 `stop()`、stdin 关闭也回 SOFT；**中断路径不进确认提示但 `close()` 仍执行** |
+| SIGTERM 处理 | 真给自己发 SIGTERM：变成 `KeyboardInterrupt`（若未安装处理器，测试进程会被直接杀掉，不会静默通过）；处理前后 `SIGTERM` 处理器被恢复 |
+| 重力补偿真机 | **未验证**，从未在硬件上进入过状态 3 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -308,6 +335,10 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
    **下一步是摆姿态采数据**：交互式跑
    `bash scripts/calibrate.sh session --arm --model 2023 --can-port can0 --serial <by-id>`，
    每个姿态按 `c`，看状态行的 `still needing range` 补关节，够了按 `f` 直接写 `leader_map.json`。
+   **`--arm` 会让机械臂进重力补偿（状态 3，电机驱动）**：先在支撑好、手能扶到、电源够得着的
+   条件下确认它真的托得住（会因 URDF 不含实际负载而缓慢漂移，这是预期），再开始采集。
+   结束时工具会**停下来问**，等你确认支撑好、按回车才交回 SOFT。没有任何外部急停，
+   所以人不能离开；Ctrl+C 会立刻回 SOFT，按之前先扶住。
    用户已确认 leader 与 X5 关节配置相同、连杆长度略有差别，
    所以拟合斜率必须≈±1；不通过就重摆姿态，不要放宽容差。
    门禁会一直挡着实机 teleop，直到 `leader_map.json` 上写了 `"calibrated": true`。
@@ -506,3 +537,25 @@ bash scripts/run.sh --mode teleop --backend mock \
 - 真正标定需要操作者用手把 leader 与机械臂摆成同一姿态（机械臂 SOFT 零力矩可拖动，
   但会因重力下落，**必须已支撑**；现场没有外部急停，全程不要 arm）。
 - 用 `--backend sdk` 试跑 leader teleop：门禁会拦下未标定的映射，这是预期行为。
+
+### 12.11 标定改用重力补偿（2026-10-02，软件已完成，真机未验证）
+
+- 起因：SOFT 下要一只手托着机械臂、另一只手按键，标定基本没法做。
+- 确认**不需要动 pinned 快照**：`InterfacesPy::gravity_compensation()` 既没绑到 Python
+  也没导出到 `.so`，但 `set_arm_status` 已绑定，`.rodata:0x32040` 的跳转表把 3 映射到
+  `stateGravityCompensation`（与第 5 节表格一致），厂商 `bimanual/script/single_arm.py:117`
+  用的也是它。厂商 `SingleArm.__init__` 的构造 + `arx_x(500,2000,10)` 与我们的 `VendorArm.__init__`
+  已经一致，所以只是多一次调用。
+- `backends.VendorArm` 加 `GRAVITY_COMPENSATION = 3` 与 `enable_gravity_compensation()`：
+  只允许从停止态进入，`stop()`/`close()` 本来就回 SOFT，即兜底路径。`stop_mode` 与
+  `app.py` 遥操作路径**没有改动**——状态 3 不是停止模式。
+- `leader_calibrate.py`：给了 `--arm` 就自动进 3（用户确认不做独立开关），
+  `session` 退出前 `confirm_release()` 问过才回 SOFT，`sample` 无终端则自动回 SOFT 并打印。
+  Ctrl+C 不再被 `run()` 吞掉，直接穿到 `main()` 返回 130 并跳过提问，`close()` 仍回 SOFT。
+- 修掉文案里所有"只读/一直停在 SOFT"的说法（工具 docstring、`draw()` 表头、`h` 帮助、
+  两个 `--arm` 帮助、`scripts/calibrate.sh` 注释、README 标定一节）。
+- 顺带补上 `sample`/`session` 的 SIGTERM 处理：以前 SIGTERM 会直接终止进程、`finally` 不执行，
+  在 SOFT 下只是损失几个姿态，在状态 3 下就变成"机械臂还在出力而进程没了"。
+- 离线验证：175 项测试通过（新增 12 项，见第 8 节表格）。顺序与中断路径都用 mock 厂商类固定。
+- **状态 3 从未在真机上跑过**：力矩来自 KDL + URDF 动力学，实际负载/夹爪不在模型里就会缓慢漂移；
+  下一步真机验证必须支撑好、有人扶着、电源够得着，先看它是托住还是下沉/漂移再决定用不用。

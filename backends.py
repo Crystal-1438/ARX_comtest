@@ -66,7 +66,17 @@ def load_sdk(sdk_root):
 
 
 class VendorArm:
+    # Arm states the SDK accepts, read from the jump table ControllerBase::update()
+    # indexes at .rodata:0x32040 in the pinned .so. Anything above 5 falls through
+    # to PROTECT. Only SOFT, GRAVITY_COMPENSATION and POSITION_CONTROL are used here:
+    #  0 SOFT                  zero torque; the arm sags and must be supported
+    #  1 GO_HOME               moves the arm on its own -- never sent by this project
+    #  2 PROTECT               protective stop; also the fallback for unknown values
+    #  3 GRAVITY_COMPENSATION  motors hold the arm up; hand-guidable, still driven
+    #  4 END_CONTROL           end-effector control, unused
+    #  5 POSITION_CONTROL      tracks set_joint_positions()
     SOFT = 0
+    GRAVITY_COMPENSATION = 3
     POSITION_CONTROL = 5
 
     def __init__(self, sdk_root, can_port, model, stop_mode):
@@ -107,6 +117,21 @@ class VendorArm:
     def stop(self):
         self.active = False
         self._check(self.interface.set_arm_status(self.SOFT), "SOFT")
+
+    def enable_gravity_compensation(self):
+        """Let the motors carry the arm's own weight so a hand can place it.
+
+        This is state 3, the same thing the vendor's Python wrapper calls
+        gravity_compensation(). It is NOT motor disable and NOT a stop mode: the
+        joints are driven, back-drivable, and the arm holds its pose until it is
+        pushed. The URDF dynamics decide the torques, so a payload the model does
+        not know about makes it drift. Never entered while tracking a target --
+        mode changes only from a stopped arm -- and stop()/close() undo it.
+        """
+        if self.active:
+            raise RuntimeError("cannot change mode while tracking a target")
+        self._check(self.interface.set_arm_status(self.GRAVITY_COMPENSATION),
+                    "GRAVITY_COMPENSATION")
 
     def read_joints(self):
         values = list(self.interface.get_joint_positions())

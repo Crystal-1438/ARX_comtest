@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import signal
 import tempfile
 import threading
 import time
@@ -13,8 +14,9 @@ from unittest import mock
 
 from leader_calibrate import (
     JITTER_WARN_DEG, MIN_FRAMES, MIN_POSES, InteractiveSession, SamplingDecoder,
-    VendorChatter, build_map, check_map_loads, collect, fit_joint, fit_session,
-    least_squares, load_session, main, pose_problems, summarise, unwrap_from_reference,
+    VendorChatter, build_map, check_map_loads, collect, confirm_release, fit_joint,
+    fit_session, least_squares, load_session, main, pose_problems, summarise,
+    treat_sigterm_as_interrupt, unwrap_from_reference,
 )
 from leader_map import Mapper, load_mapping
 
@@ -557,6 +559,108 @@ class InteractiveTests(unittest.TestCase):
         # Nothing to log: without --arm the vendor library is never loaded.
         self.assertEqual((self.root / "arm.log").read_bytes(), b"")
 
+    def test_the_arm_holds_through_the_session_and_is_released_on_confirmation(self):
+        """--arm means gravity compensation, and SOFT comes back only on a keypress."""
+        console_master, console_slave = pty.openpty()
+        leader_master, leader_slave = pty.openpty()
+        for fd in (console_master, console_slave, leader_master, leader_slave):
+            self.addCleanup(os.close, fd)
+        stdin = os.fdopen(os.dup(console_slave), "r")
+        self.addCleanup(stdin.close)
+        quiet = os.open(os.devnull, os.O_WRONLY)
+        saved_stdout = os.dup(1)
+        os.dup2(quiet, 1)
+        self.addCleanup(lambda: (os.dup2(saved_stdout, 1), os.close(saved_stdout),
+                                 os.close(quiet)))
+
+        patcher = mock.patch("backends.VendorArm")
+        self.addCleanup(patcher.stop)
+        vendor = patcher.start()
+        vendor.return_value.read_joints.return_value = (0.0,) * 6
+
+        def type_keys():
+            # Spaced far enough apart that each lands in its own poll: "\r" inside
+            # a live session would be a capture, not a confirmation.
+            os.write(console_master, b"c")
+            time.sleep(1.0)
+            os.write(console_master, b"q")
+            time.sleep(1.0)
+            os.write(console_master, b"\r")  # Now it means "let go".
+
+        timer = threading.Timer(0.2, type_keys)
+        self.addCleanup(timer.cancel)
+        timer.start()
+        leader = threading.Timer(0.1, os.write, (leader_master, payload(LEADER_POSES[0])))
+        self.addCleanup(leader.cancel)
+        leader.start()
+        with mock.patch("sys.stdin", stdin):
+            code = main(["session", "--serial", os.ttyname(leader_slave),
+                         "--arm", "--model", "2023",
+                         "--out", str(self.root / "session.jsonl"),
+                         "--map", str(self.root / "leader_map.json"),
+                         "--arm-log", str(self.root / "arm.log"), "--plain"])
+        self.assertEqual(code, 2)
+        vendor.return_value.enable_gravity_compensation.assert_called_once_with()
+        # stop() is the confirmation path; close() still runs afterwards as the
+        # unconditional backstop, and both end at SOFT.
+        vendor.return_value.stop.assert_called_once_with()
+        vendor.return_value.close.assert_called_once_with()
+        self.assertEqual(len(load_session(self.root / "session.jsonl")), 1)
+
+
+class ReleaseTests(unittest.TestCase):
+    """Handing the arm back to SOFT is a question, not a side effect of exiting."""
+
+    def setUp(self):
+        self.arm = mock.Mock()
+        self.console = io.StringIO()
+
+    def release(self, keys):
+        return confirm_release(self.arm, keys, self.console, sleep=lambda _: None)
+
+    def test_the_arm_holds_until_the_operator_confirms(self):
+        self.assertTrue(self.release(FakeKeys(["\r"])))
+        self.arm.stop.assert_called_once_with()
+        self.assertIn("GRAVITY COMPENSATION", self.console.getvalue())
+        self.assertIn("SOFT", self.console.getvalue())
+
+    def test_silence_is_not_a_confirmation(self):
+        # Nothing to read yet must not be mistaken for a keypress.
+        self.assertTrue(self.release(FakeKeys(["", "", "g"])))
+        self.arm.stop.assert_called_once_with()
+
+    def test_a_closed_stdin_still_returns_the_arm_to_soft(self):
+        # The terminal went away; leaving the arm driven is the worse option.
+        keys = FakeKeys([])
+        keys.exhausted = True
+        self.assertFalse(self.release(keys))
+        self.arm.stop.assert_called_once_with()
+        self.assertIn("stdin closed", self.console.getvalue())
+
+
+class SignalTests(unittest.TestCase):
+    """SIGTERM must not skip the cleanup that hands a driven arm back to SOFT."""
+
+    def test_sigterm_becomes_an_interrupt(self):
+        @treat_sigterm_as_interrupt
+        def dying():
+            os.kill(os.getpid(), signal.SIGTERM)
+            return "not reached"
+
+        with self.assertRaises(KeyboardInterrupt):
+            dying()
+
+    def test_the_previous_handler_is_restored(self):
+        before = signal.getsignal(signal.SIGTERM)
+
+        @treat_sigterm_as_interrupt
+        def handler_while_running():
+            return signal.getsignal(signal.SIGTERM)
+
+        installed = handler_while_running()
+        self.assertIsNot(installed, before)
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
 
 class VendorChatterTests(unittest.TestCase):
     """The vendor SDK prints from C++, so fd 1 has to move for real."""
@@ -671,6 +775,75 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(poses[0]["label"], "home")
         self.assertIsNone(poses[0]["arm_deg"])
         self.assertAlmostEqual(poses[0]["raw_deg"][0], 8.1)
+
+    def test_sample_with_arm_holds_then_hands_the_arm_back(self):
+        vendor = self.patched_arm()
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        self.send_after_open(master, line(81, 19, 106, 256, 299, 201, 500) * 40)
+        self.assertEqual(main(["sample", "--serial", os.ttyname(slave),
+                               "--out", str(self.session), "--window", "0.4",
+                               "--arm", "--model", "2023"]), 0)
+        # Order matters: the arm must be holding the pose before it is read, and
+        # must be back in SOFT before this process goes away.
+        self.assertEqual([call[0] for call in vendor.return_value.method_calls],
+                         ["enable_gravity_compensation", "read_joints", "close"])
+
+    def test_sample_without_arm_never_constructs_the_sdk(self):
+        vendor = self.patched_arm()
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        self.send_after_open(master, line(81, 19, 106, 256, 299, 201, 500) * 40)
+        self.assertEqual(main(["sample", "--serial", os.ttyname(slave),
+                               "--out", str(self.session), "--window", "0.4"]), 0)
+        vendor.assert_not_called()
+
+    def test_an_interrupt_hands_the_arm_back_without_asking(self):
+        """Ctrl-C wants out now, so the release prompt must not run."""
+        vendor = self.patched_arm()
+        _, leader_slave, stdin = self.terminal()
+        with mock.patch("sys.stdin", stdin):
+            with mock.patch("leader_calibrate.InteractiveSession") as live:
+                live.return_value.run.side_effect = KeyboardInterrupt
+                code = main(["session", "--serial", os.ttyname(leader_slave),
+                             "--arm", "--model", "2023",
+                             "--out", str(self.session),
+                             "--map", str(self.out),
+                             "--arm-log", str(self.out.parent / "arm.log"), "--plain"])
+        self.assertEqual(code, 130)
+        vendor.return_value.enable_gravity_compensation.assert_called_once_with()
+        # stop() is what confirm_release would have sent; close() is the belt-and-braces
+        # release in the finally, and it always has to happen.
+        vendor.return_value.stop.assert_not_called()
+        vendor.return_value.close.assert_called_once_with()
+
+    def patched_arm(self):
+        """A vendor SDK that records the arm states it was asked for."""
+        patcher = mock.patch("backends.VendorArm")
+        self.addCleanup(patcher.stop)
+        vendor = patcher.start()
+        vendor.return_value.read_joints.return_value = (0.0,) * 6
+        return vendor
+
+    def terminal(self):
+        """A pty for the keyboard, a pty for the leader, and fd 1 quieted.
+
+        session() refuses to start without a tty and draws on the descriptor it
+        saved from fd 1, so both have to be real file descriptors.
+        """
+        console_master, console_slave = pty.openpty()
+        leader_master, leader_slave = pty.openpty()
+        for fd in (console_master, console_slave, leader_master, leader_slave):
+            self.addCleanup(os.close, fd)
+        quiet = os.open(os.devnull, os.O_WRONLY)
+        saved = os.dup(1)
+        os.dup2(quiet, 1)
+        self.addCleanup(lambda: (os.dup2(saved, 1), os.close(saved), os.close(quiet)))
+        stdin = os.fdopen(os.dup(console_slave), "r")
+        self.addCleanup(stdin.close)
+        return console_master, leader_slave, stdin
 
     def test_a_second_sample_appends_rather_than_replaces(self):
         master, slave = pty.openpty()

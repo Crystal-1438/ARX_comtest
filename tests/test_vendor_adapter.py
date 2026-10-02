@@ -38,6 +38,26 @@ class VendorAdapterTests(unittest.TestCase):
             self.arm.start((0.1,) * 6)
         self.arm.interface.set_arm_status.assert_not_called()
 
+    def test_gravity_compensation_is_state_three_and_close_undoes_it(self):
+        self.arm.enable_gravity_compensation()
+        self.arm.close()
+        self.assertEqual([c[0] for c in self.arm.interface.method_calls],
+                         ["set_arm_status", "set_arm_status"])
+        self.assertEqual(self.arm.interface.set_arm_status.call_args_list[0].args, (3,))
+        # Nothing may leave the arm driven: the last word is always SOFT.
+        self.assertEqual(self.arm.interface.set_arm_status.call_args_list[-1].args, (0,))
+
+    def test_gravity_compensation_refused_while_a_target_is_tracked(self):
+        self.arm.active = True
+        with self.assertRaises(RuntimeError):
+            self.arm.enable_gravity_compensation()
+        self.arm.interface.set_arm_status.assert_not_called()
+
+    def test_rejected_gravity_compensation_raises(self):
+        self.arm.interface.set_arm_status.return_value = False
+        with self.assertRaises(RuntimeError):
+            self.arm.enable_gravity_compensation()
+
 
 if __name__ == "__main__":
     unittest.main()

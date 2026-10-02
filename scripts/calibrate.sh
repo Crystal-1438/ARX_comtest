@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Calibrate the leader against the arm's joint coordinates. Read-only: the arm is
-# left in SOFT, is never armed and never receives a target.
+# Calibrate the leader against the arm's joint coordinates. The arm is never armed
+# and never receives a target, but with --arm it is put in gravity compensation --
+# motor-driven to hold its own weight -- and only handed back to SOFT after the
+# tool asks. Keep it supported and stay with it; SOFT is zero torque, not disable.
 #
 #   bash scripts/calibrate.sh session --serial /dev/serial/by-id/usb-1a86_... \
 #       --arm --model 2023

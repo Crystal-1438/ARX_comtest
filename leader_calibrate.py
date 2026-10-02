@@ -17,17 +17,21 @@ direction. The mechanism is a 1:1 joint replica with different link lengths, and
 link lengths do not affect joint angles, so the fitted slope has to come out at
 +/-1. When it does not, this reports that instead of bending the numbers.
 
-Read-only throughout: never arms, never sends a target, never changes the arm's
-state beyond the SOFT mode the vendor constructor already sets.
+The arm is never armed and never receives a target. With --arm it is put into
+gravity compensation (state 3) so it carries its own weight while a hand places
+it; that is a driven mode, not motor disable, and the tool hands it back to SOFT
+before it exits.
 """
 
 import argparse
 import collections
 from datetime import date
+import functools
 import json
 import math
 import os
 from pathlib import Path
+import signal
 import statistics
 import sys
 import tempfile
@@ -54,6 +58,15 @@ SAME_POSE_WARN_DEG = 5.0
 # Keys the interactive session acts on. Enter and space both capture, because
 # that is what a hand already on the keyboard reaches for.
 CAPTURE_KEYS = frozenset("c\r\n ")
+# Keys that confirm handing the arm back to SOFT once the session is over.
+RELEASE_KEYS = frozenset("\r\n yg")
+
+GRAVITY_WARNING = (
+    "the arm is now in GRAVITY COMPENSATION (state 3): the motors are driving it to\n"
+    "hold its own weight. It is back-drivable, so you can place it by hand, but it is\n"
+    "NOT disabled and there is no emergency stop here. Keep a hand on it, keep it\n"
+    "supported, and stay with it until this tool has handed it back to SOFT.\n"
+)
 
 
 class SamplingDecoder(LeaderUartDecoder):
@@ -274,18 +287,78 @@ def check_map_loads(config):
         return load_mapping(probe)
 
 
+def confirm_release(arm, keys, console, sleep=time.sleep):
+    """Hand the arm back to SOFT, but only once the operator says it is safe.
+
+    Returning to SOFT means zero torque: the arm drops to whatever is holding it.
+    Doing that the instant the session ends would drop it while the operator is
+    still at the keyboard, and skipping it would leave the arm driven with no
+    process left on the CAN bus. So the arm keeps holding until someone who can
+    see the arm confirms. Returns True when the operator confirmed.
+    """
+    console.write("\nthe arm is still in GRAVITY COMPENSATION, holding itself up.\n"
+                  "check that it is supported, then press Enter to hand it back to SOFT\n"
+                  "(zero torque -- it will sag onto the support).\n")
+    console.flush()
+    while True:
+        for key in keys.read_keys():
+            if key in RELEASE_KEYS:
+                arm.stop()
+                console.write("arm returned to SOFT.\n")
+                return True
+        if keys.exhausted:
+            console.write("stdin closed; returning the arm to SOFT.\n")
+            arm.stop()
+            return False
+        sleep(0.05)
+
+
+def _raise_interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def treat_sigterm_as_interrupt(function):
+    """Make the arm-driving subcommands clean up on SIGTERM, not just on Ctrl-C.
+
+    Python already turns SIGINT into KeyboardInterrupt, but SIGTERM's default
+    action ends the process where it stands: the finally chain that hands the arm
+    back to SOFT would never run, leaving a driven arm with no process behind it.
+    Raising instead reuses the Ctrl-C path end to end, at the cost of reporting
+    exit code 130 for a termination too.
+    """
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        try:
+            previous = signal.signal(signal.SIGTERM, _raise_interrupt)
+        except ValueError:  # Not the main thread; signal.signal refuses.
+            return function(*args, **kwargs)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    return wrapper
+
+
+@treat_sigterm_as_interrupt
 def sample(args):
     from backends import VendorArm  # Imported here so the no-arm path never loads the SDK.
 
     if args.window <= 0:
         raise ValueError("--window must be positive")
     arm = None
+    holding = False
     try:
         if args.arm:
             if not args.model:
                 raise ValueError("--arm needs --model to know which URDF to load")
-            # The constructor also puts the arm in SOFT. Nothing below commands it.
+            # The constructor puts the arm in SOFT; --arm then hands it to gravity
+            # compensation so a hand can place it for the pose.
             arm = VendorArm(args.sdk_root, args.can_port, args.model, "soft")
+            arm.enable_gravity_compensation()
+            holding = True
+            print(GRAVITY_WARNING, end="")
         source = SerialInput(args.serial, args.baud)
         try:
             samples, errors = collect(SamplingDecoder(), source, args.window)
@@ -299,6 +372,10 @@ def sample(args):
             pose["arm_deg"] = [math.degrees(value) for value in arm.read_joints()]
     finally:
         if arm is not None:
+            if holding:
+                # No terminal to ask on here, so say what is about to happen instead.
+                print("\narm: handing back to SOFT (zero torque) -- it will sag onto "
+                      "its support.")
             arm.close()
 
     with open(args.out, "a", encoding="utf-8") as stream:
@@ -570,7 +647,7 @@ class InteractiveSession:
             self.finish()
         elif key == "h":
             self.message = ("c/enter capture, u undo, f fit and write, q quit; "
-                            "drag the arm by hand -- it stays in SOFT")
+                            "drag the arm by hand -- gravity compensation holds it up")
         elif key == "q":
             self.finished = True
         elif key in ("\x03", "\x04"):  # Ctrl-C/Ctrl-D if ISIG is ever off.
@@ -580,7 +657,12 @@ class InteractiveSession:
 
     def draw(self):
         pose = self.window_pose()
-        lines = ["leader calibration -- the arm stays in SOFT, nothing is commanded", ""]
+        if self.arm is None:
+            headline = "leader calibration -- no arm attached, nothing is commanded"
+        else:
+            headline = ("leader calibration -- the arm is in GRAVITY COMPENSATION "
+                        "(motor-driven, hand-guidable); no target is sent")
+        lines = [headline, ""]
         lines.append("     leader deg   jitter      arm deg")
         for index in range(JOINTS):
             if pose is None:
@@ -613,11 +695,12 @@ class InteractiveSession:
         self.sleep(0.25)
 
     def run(self):
+        # An interrupt is deliberately left to propagate: the finally still keeps
+        # the poses, but the caller must not go on to prompt for a graceful release
+        # when the operator has just hit Ctrl-C.
         try:
             while not self.finished and not self.keys.exhausted:
                 self.step()
-        except KeyboardInterrupt:
-            self.message = "interrupted"
         finally:
             if not self.plain and self.drawn:
                 self.emit("\n")
@@ -633,6 +716,7 @@ class InteractiveSession:
         return 2
 
 
+@treat_sigterm_as_interrupt
 def session(args):
     """Run the interactive capture loop against real hardware."""
     from backends import VendorArm  # Imported here so the no-arm path never loads the SDK.
@@ -650,6 +734,7 @@ def session(args):
         # constructor and its destructor both print from C++.
         with VendorChatter(args.arm_log) as console:
             arm = None
+            holding = released = False
             if args.arm:
                 if not args.model:
                     raise ValueError("--arm needs --model to know which URDF to load")
@@ -657,6 +742,14 @@ def session(args):
                               f"{args.arm_log}\n")
                 arm = VendorArm(args.sdk_root, args.can_port, args.model, "soft")
             try:
+                if arm is not None:
+                    # --arm means "hold the arm up for me while I place it", so
+                    # entering gravity compensation is the point of the flag, not
+                    # an extra option. Inside the try: a failure here must still
+                    # run close(), or the arm stays driven with nothing to undo it.
+                    arm.enable_gravity_compensation()
+                    holding = True
+                    console.write(GRAVITY_WARNING)
                 source = SerialInput(args.serial, args.baud)
                 try:
                     live = InteractiveSession(
@@ -664,11 +757,20 @@ def session(args):
                         session_path=args.out, map_path=args.map, window=args.window,
                         min_span=args.min_span, slope_tolerance=args.slope_tolerance,
                         tolerance=args.tolerance, plain=args.plain)
-                    return live.run()
+                    code = live.run()
                 finally:
                     source.close()
+                # Ctrl-C skips this: a propagating interrupt means the operator wants
+                # out now, not a question, and close() still returns the arm to SOFT.
+                if arm is not None:
+                    released = confirm_release(arm, keys, console)
+                return code
             finally:
                 if arm is not None:
+                    if holding and not released:
+                        console.write("\narm: handing back to SOFT (zero torque) -- "
+                                      "it will sag onto its support.\n")
+                        console.flush()
                     arm.close()
     finally:
         keys.close()
@@ -706,7 +808,8 @@ def main(argv=None):
                       help="leader port; use /dev/serial/by-id/, not a ttyACM number")
     live.add_argument("--baud", type=int, default=115200)
     live.add_argument("--arm", action="store_true",
-                      help="also read the arm (constructs the vendor SDK, SOFT, read-only)")
+                      help="also read the arm; puts it in gravity compensation so it "
+                           "holds itself up, and asks before handing it back to SOFT")
     live.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK)
     live.add_argument("--can-port", default="can0")
     live.add_argument("--model", choices=("2023", "2025"))
@@ -730,7 +833,8 @@ def main(argv=None):
                          help="leader port; use /dev/serial/by-id/, not a ttyACM number")
     sampler.add_argument("--baud", type=int, default=115200)
     sampler.add_argument("--arm", action="store_true",
-                         help="also read the arm (constructs the vendor SDK, SOFT, read-only)")
+                         help="also read the arm; puts it in gravity compensation while "
+                              "the pose is read, then hands it back to SOFT")
     sampler.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK)
     sampler.add_argument("--can-port", default="can0")
     sampler.add_argument("--model", choices=("2023", "2025"))
