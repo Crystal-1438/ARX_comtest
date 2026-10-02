@@ -401,7 +401,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 255 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 261 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -415,6 +415,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | 重力补偿真机 | **操作者反馈"基本能用"**（2026-10-03，未量化）：跑完过一次 `session --arm`（1 个 301 帧、0 坏帧的姿态，见第 12.14 节），据此认为状态 3 能托住机械臂，标定流程不需要再等它 |
 | 真机标定产物 | 已生成 `leader_map.json`（方向 `+ − − − + −`，手输，**未经第二姿态复核**），见第 12.14 节 |
 | 整圈锚定与 arm 门禁（离线） | `resolve_turns` 的整圈性质（`turns` 是 360 的整数倍、残差恒在 ±180° 内、残差 ≡ −`shortest_turn` 模一圈，两函数钉在一起防漂移）、30° 边界两侧、跨 `0/360` 的 10° 必须放行（旧判据报 −350°）；`Mapper.anchor` 只在 `ok` 时写 `bias`、`reset()` 连 `bias` 一起清、`bias` 只进 `to_radians` 不污染 `continuous`（标定工具读它）；拒绝信息给"要转多少"与"会走多少"（大小相等，`-residual` 对 `sign * residual`）并列出**所有**不合格关节；解码器 `anchor()` 在首帧离 `reference_deg` 好几百时仍放行、没帧时**返回理由而不是抛**、握手/`reset()`/`ProtocolError` 后清偏置需重新 anchor、没 anchor 过时 `leader.anchor` 是 `null`；`Controller.pre_arm` 的**两条 arm 路都过**（串口帧与本地按键各一条测试）、被拒时 `arm.writes` 为空且 `arm.start` 未被调用、FAULT 下不触发 hook；map 校验 `reference_deg` 的长度/数值/`0..360` 区间（字段保留但不再是门禁）；PTY 端到端：左右同姿态→`a` 进 ACTIVE、偏 90°→`reason` 点名 J3 且 `joints_rad` 全程为 0（机械臂一个目标都没收到）、移回去重按即进 ACTIVE、首帧之前按 `a` 被拒、跨 `0/360` 的 10° 装上 360° 偏置并继续同向跟随 |
+| 状态行打印节流（离线） | `due_for_print` 直接单测：未到间隔不打、到点打、`state` 变立刻打、**`state` 不变而 `reason` 变也立刻打**、同一条不重复打；PTY 里把 `--print-rate` 压到 1 Hz 跑约 2 s，记录数必须仍是"几条"而不是随 100 Hz 控制循环走（**把 `next_print` 改成每轮都到期，这条即以 60+ 条失败**），见第 12.19 节 |
 | `fit` 的锚点（离线） | 夹具把 session 的 `continuous_deg` 整体挪一圈（`raw` 不变）后，写出的 map 仍能被新 `Mapper` 从 `raw` 复现出记录的臂角；**把这一行改回 `continuous_deg` 该测试即以 360.0 的差值失败**（三条测试同时失败），见第 12.16 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
@@ -490,6 +491,10 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
      不是"一动不动"。手别扶着。
    - **按 `a` 之前是 STOPPED**，teleop 已在读 leader 并打印。**收到第一帧之前按 `a` 会被拒**，
      所以先等 `leader.frame` 出现（这同时确认了流是活的）。
+   - **默认 `--print-rate 10` 在真终端上读不过来**（一行是一整条 JSON）；用
+     `--print-rate 1`（或过滤 stdout 只留状态变化，命令见 README「按键控制」）。
+     调低不会漏掉按 `a` 的结果：`state` 或 `reason` 一变就当场打一行，见第 12.19 节。
+     判断 `a` 有没有被处理过，看 `leader.anchor` 是不是 `null`。
    - 只动**一个**关节一点点，确认机械臂同向；反向立刻按 `s`。方向是手输且未经复核的。
    - `limits.json` 目前只能用 `limits.example.json` 抄一份——**限位本身还没在实机上校准**，
      而它的 J2/J3 下限是 0.0，机械臂零位却在 0.006 rad 附近：反馈一旦略微为负，
@@ -1033,3 +1038,49 @@ mock 臂停在零位，而 `CAPTURED` 是 79.5/328.1/…——新判据下**每�
 
 **真机**：本轮未接硬件。真 arm 前的操作步骤已按新语义改写在 README「按 `a` 时的整圈锚定」
 与第 9 节第 6 条。
+
+### 12.19 状态行按定时器打，但状态/理由一变就当场打（2026-10-03）
+
+操作者实机反馈：**「日志跳动太快，什么都看不清，也不知道按 a 后有没有响应」**。
+两个问题，第一个是默认值，第二个是设计。
+
+**默认太快**：`--print-rate` 缺省 10 行/秒，一行是一整条 JSON（含整个 `leader` 块，
+里面有最近一帧的七个字段），屏幕上就是一面墙。已经在 README「按键控制」里写明
+调低它（`--print-rate 1` 甚至 `0.2`）以及"关键信息不会因为调低而漏掉"，并给了一段
+只打状态/理由变化的过滤器脚本（过滤 stdout 不影响 stdin 上的按键）。
+
+**"不知道按 a 有没有响应"是个真 bug，不是观感问题。** 原判断是
+
+```python
+if now >= next_print or controller.state != previous_state:
+```
+
+而**拒绝时 `state` 根本不变**（还是 `STOPPED`），变的只有 `reason`。于是把
+`--print-rate` 调低到能看的程度之后，按 `a` 被拒的答复要**等满一个打印间隔**才出来
+——2 秒的间隔就是 2 秒的沉默，恰好是操作者正盯着屏幕等回话的那一刻。改成把
+`(state, reason)` 一起记：
+
+```python
+def due_for_print(now, next_print, seen, state, reason):
+    return now >= next_print or (state, reason) != seen
+```
+
+抽成纯函数是为了能直接单测（控制循环本身没法单测）。`reason` 在 ACTIVE 跟踪期间
+是常量（"armed at measured position"），只在 `stop()` / `_apply` 里改，所以不会退化成
+每轮都打。`grep` 一遍 `control.py` 确认 `self.reason` 的赋值点只有这两处。
+
+**验证**（离线，**261 项通过**）：
+- `tests/test_app.py::PrintThrottleTests`：未到间隔不打、到点打、`state` 变立刻打、
+  **`state` 不变而 `reason` 变也立刻打**、同一条不重复打。
+- `tests/test_leader_integration.py::PrintRateTests`：PTY 里 `--print-rate 1` 跑约 2 s
+  （`frames ≥ 60`），断言落下的记录数 `< 6`——控制循环是 100 Hz，这一条同时证明
+  `--print-rate` 真的接到了循环上（此前**完全没测**）。harness 的 `--print-rate` 从写死的
+  `"100"` 提成类属性 `PRINT_RATE`。
+- 两次变异检验：把 `due_for_print` 退回只比 `state` → `PrintThrottleTests` 里那条失败；
+  把 `next_print` 改成每轮都到期 → `PrintRateTests` 那条约 60 条记录、失败。
+- 套件总时长从 8.2 s 涨到 10.3 s（那条 PTY 测试要真等约 2 s）。
+
+**离线复算**（用真实那份 `leader_map.json`，不改硬件）：操作者当时那个姿态的锚定结果是
+J2 `turns +360°`、残差 **+51.4°**（机械臂会走 −51.4°，J2 的 `sign` 是 −1），
+J5 `turns +360°`、残差 **+91.6°**（会走 +91.6°），最差关节 J5，`ok = false`
+——即 30° 之下**仍然会被拒**，与 README 里的拒绝样例逐字一致。

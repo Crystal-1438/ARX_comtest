@@ -154,6 +154,19 @@ def install_arm_check(controller, decoder):
     controller.pre_arm = getattr(decoder, "anchor", None)
 
 
+def due_for_print(now, next_print, seen, state, reason):
+    """Whether this pass prints a status line.
+
+    On a timer, but a change of state or reason prints at once whatever the
+    timer says. A refusal leaves the state exactly where it was and only
+    rewrites the reason, so on the timer alone the answer to pressing a would
+    come out up to a whole print interval later -- and that is the one moment
+    the operator is standing there waiting for it. Reading the two together
+    also means the loop never has to print merely because it noticed a change.
+    """
+    return now >= next_print or (state, reason) != seen
+
+
 def emit(controller, joints, backend, decoder=None):
     record = {
         "state": controller.state, "reason": controller.reason,
@@ -213,7 +226,7 @@ def run(args):
         install_arm_check(controller, decoder)
         started = time.monotonic()
         next_tick = next_print = started
-        previous_state = None
+        previous = None  # (state, reason) of the last printed line
         while not interrupted:
             now = time.monotonic()
             if args.duration and now - started >= args.duration:
@@ -244,10 +257,10 @@ def run(args):
                     getattr(decoder, "reset", lambda: None)()
                     controller.stop(f"invalid serial input: {exc}", fault=True)
             joints = controller.tick(time.monotonic())
-            if now >= next_print or controller.state != previous_state:
+            if due_for_print(now, next_print, previous, controller.state, controller.reason):
                 emit(controller, joints, args.backend, decoder)
                 next_print = now + 1 / args.print_rate
-                previous_state = controller.state
+                previous = (controller.state, controller.reason)
             next_tick += 1 / args.rate
             delay = next_tick - time.monotonic()
             if delay > 0:

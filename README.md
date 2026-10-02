@@ -265,6 +265,35 @@ bash scripts/run.sh --mode teleop --backend mock \
 按键先于同批串口帧处理，所以本地停止不会被同一批的目标盖过。
 FAULT 后必须先按 `s` 再按 `a`，与线协议恢复语义一致。
 
+**看不清就调 `--print-rate`**：默认 10 行/秒，一行是一整条 JSON，实际读不过来。
+调低（`--print-rate 1` 甚至 `0.2`）不会漏掉关键信息——**`state` 或 `reason` 一变就立刻打一行**，
+不等定时器，所以按 `a` 的结果（`armed at measured position`，或那句
+`refusing to arm: ...`）永远当场出现。定时器只管"什么都没变"时的心跳行。
+想只盯状态变化，把输出喂给过滤器即可（按键从终端读，不受管道影响）：
+
+```bash
+... --operator-keys --limits limits.json | python3 -u -c '
+import json, sys, time
+seen = None
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+    except ValueError:
+        print(line, end="", flush=True)   # tracebacks and other noise pass through
+        continue
+    if (r["state"], r["reason"]) == seen:
+        continue
+    seen = (r["state"], r["reason"])
+    anchor = (r.get("leader") or {}).get("anchor")
+    print(time.strftime("%H:%M:%S"), r["state"], "|", r["reason"],
+          "| anchor:", "null" if anchor is None else ("ok" if anchor["ok"] else "refused"),
+          flush=True)
+'
+```
+
+`leader.anchor` 是不是 `null` 就能看出按 `a` 有没有被处理过：`null` 表示还没有锚定过
+（没按过，或按了但那会儿连一帧都没收到——后者 `reason` 会写明）。
+
 `a` 有一个前置条件：**至少要收到过一帧，而且 leader 和机械臂得在同一个姿态（30° 以内）**。
 意思是**用手把 leader 摆成机械臂现在的样子**，再按 `a`。不满足就不会 arm，
 `reason` 里逐关节写出**要转到哪儿**和**为什么**，机械臂一个目标都不会收到：

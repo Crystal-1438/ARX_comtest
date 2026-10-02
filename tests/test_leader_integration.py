@@ -67,6 +67,8 @@ class LeaderHarness(unittest.TestCase):
     groups below share this and differ only in ``mapping_config``.
     """
 
+    PRINT_RATE = "100"
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -84,7 +86,7 @@ class LeaderHarness(unittest.TestCase):
             [sys.executable, "-u", str(APP), "--mode", "teleop", "--backend", "mock",
              "--serial", os.ttyname(self.slave), "--decoder", str(DECODER),
              "--leader-map", str(mapping), "--operator-keys", "--limits", str(limits),
-             "--rate", "100", "--print-rate", "100"],
+             "--rate", "100", "--print-rate", self.PRINT_RATE],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment,
         )
@@ -280,6 +282,23 @@ class MismatchedPoseTests(LeaderHarness):
                       CAPTURED)
         self.press(b"a")
         self.wait_for(lambda r: r["state"] == "ACTIVE", CAPTURED)
+
+
+class PrintRateTests(LeaderHarness):
+    """A rate low enough to read has to actually be low.
+
+    The loop runs at 100 Hz and the readout is on its own timer, so the two are
+    easy to conflate at the call site -- and the whole point of turning the rate
+    down is that a person can read the line.
+    """
+
+    PRINT_RATE = "1"
+
+    def test_the_readout_keeps_to_the_print_rate_not_the_control_loop(self):
+        # ~2 s of streaming, so a rate of 1 Hz owes a couple of lines and the
+        # control loop would have produced a couple of hundred.
+        self.wait_for(lambda r: r.get("leader", {}).get("frames", 0) >= 60, CAPTURED)
+        self.assertLess(len(self.records), 6)
 
 
 class RolloverTests(LeaderHarness):

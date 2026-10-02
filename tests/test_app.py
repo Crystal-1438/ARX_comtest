@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app import (BUNDLED_SDK, check_decoder_for_hardware, decoder_from_path,
-                 install_arm_check, load_limits, run)
+                 due_for_print, install_arm_check, load_limits, run)
 from backends import MockArm
 from control import Controller, Limits
 from protocol import Command, JsonLineDecoder, ProtocolError
@@ -95,6 +95,35 @@ class AppTests(unittest.TestCase):
                                                leader_map=mapping)), 0)
                 # run() exports the override; the decoder reads it at load time.
                 self.assertEqual(os.environ["ARX_LEADER_MAP"], str(mapping))
+
+
+class PrintThrottleTests(unittest.TestCase):
+    """Status lines are on a timer, except when the answer is worth having now.
+
+    A refusal keeps the state where it was, so keying only on the state would
+    hide the reply to ``a`` behind the print interval -- at a rate low enough
+    to actually read, seconds of it.
+    """
+
+    STOPPED = ("STOPPED", "startup")
+    REFUSED = "refusing to arm: the leader and the arm are not in the same pose"
+
+    def test_nothing_prints_before_the_interval(self):
+        self.assertFalse(due_for_print(1.0, 2.0, self.STOPPED, *self.STOPPED))
+
+    def test_the_interval_prints_again(self):
+        self.assertTrue(due_for_print(2.0, 2.0, self.STOPPED, *self.STOPPED))
+
+    def test_a_new_state_prints_at_once(self):
+        self.assertTrue(due_for_print(1.0, 2.0, self.STOPPED, "ACTIVE",
+                                      "armed at measured position"))
+
+    def test_a_new_reason_prints_at_once_even_in_the_same_state(self):
+        self.assertTrue(due_for_print(1.0, 2.0, self.STOPPED, "STOPPED", self.REFUSED))
+
+    def test_the_reason_only_counts_while_it_is_the_last_thing_printed(self):
+        seen = ("STOPPED", self.REFUSED)
+        self.assertFalse(due_for_print(1.0, 2.0, seen, "STOPPED", self.REFUSED))
 
 
 class ArmCheckWiringTests(unittest.TestCase):
