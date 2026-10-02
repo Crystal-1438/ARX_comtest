@@ -41,6 +41,14 @@ class Controller:
         self.last_tick = now
         self.target = None
         self.commanded = None
+        # Optional veto on enabling the arm, called with the measured joints.
+        # Returning a reason refuses the arm and shows the reason; returning
+        # None allows it. It belongs to the caller -- nothing here knows what
+        # would make a decoder want to refuse -- but it has to be *here* rather
+        # than at either entry point, because ARM arrives both from the wire
+        # (handle) and from the operator's key (operator_arm) and the two must
+        # not be able to disagree about whether the session is safe to enable.
+        self.pre_arm = None
         self.arm.stop()
 
     def stop(self, reason, fault=False):
@@ -57,9 +65,17 @@ class Controller:
         if kind == "arm":
             if self.state != "STOPPED":
                 return  # Repeated ARM frames cannot refresh the target watchdog.
-            self.commanded = self.limits.check(self.arm.read_joints())
-            self.target = self.commanded
-            self.arm.start(self.commanded)
+            # Read once and hand it on: the veto and the position the arm is
+            # started from have to be the same sample, or the check could pass
+            # on one reading and the arm be enabled at another.
+            measured = self.limits.check(self.arm.read_joints())
+            if self.pre_arm is not None:
+                blocker = self.pre_arm(measured)
+                if blocker:
+                    self.stop(f"refusing to arm: {blocker}")
+                    return
+            self.commanded = self.target = measured
+            self.arm.start(measured)
             self.state = "ACTIVE"
             self.reason = "armed at measured position"
             self.last_input = self.last_tick = now

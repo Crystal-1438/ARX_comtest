@@ -47,7 +47,7 @@ import time
 
 from app import DEFAULT_SDK, SerialInput
 from leader_decoder import LeaderUartDecoder
-from leader_map import JOINTS, REFERENCE_TOLERANCE_DEG, load_mapping, uncalibrated
+from leader_map import ANCHOR_TOLERANCE_DEG, JOINTS, load_mapping, uncalibrated
 from operator_keys import KeyInput
 from protocol import ProtocolError
 
@@ -330,11 +330,12 @@ def build_map(joints, poses, source, evidence):
         f"Source session: {source} ({len(poses)} pose(s)).",
         *evidence,
         "The first pose of the session is the reference, and reference_deg below is",
-        "its raw leader angles. Start a teleop session with the leader in that pose:",
-        "the mapper unwraps from the first frame it sees, so starting anywhere else",
-        "shifts every target by that much, and the arm walks off by it as soon as it",
-        f"is armed. app.py refuses to arm while any joint is more than "
-        f"{REFERENCE_TOLERANCE_DEG:.0f} deg away.",
+        "its raw leader angles: it records where these offsets came from, and a",
+        "re-run is expected to reproduce them. A teleop session does not have to",
+        "start there. The encoder reports one number per turn, so which turn a",
+        "joint is on is settled at arm time from the arm's own measured pose, and",
+        "the leader only has to be in the same pose as the arm to within",
+        f"{ANCHOR_TOLERANCE_DEG:.0f} deg.",
         "Reference raw angles (deg): " + ", ".join(f"{value:.1f}" for value in reference),
         f"Date: {date.today().isoformat()}.",
     ]
@@ -511,8 +512,8 @@ def fit(args):
     if args.out:
         args.out.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         print(f"\nwrote {args.out}")
-        print("Next: start the teleop session with the leader in the reference pose above "
-              f"(within {REFERENCE_TOLERANCE_DEG:.0f} deg on every joint).")
+        print("Next: at teleop, put the leader in the same pose as the arm -- within "
+              f"{ANCHOR_TOLERANCE_DEG:.0f} deg on every joint -- then press a to arm.")
     else:
         print("\n(re-run with --out leader_map.json to write it)")
     return 0
@@ -717,10 +718,10 @@ class InteractiveSession:
             self.map_path.write_text(text + "\n", encoding="utf-8")
             self.wrote_map = True
             self.emit(f"wrote {self.map_path}\n")
-            self.emit("Next: start the teleop session with the leader in the reference "
-                      f"pose,\npose 1 ({', '.join(f'{v:.1f}' for v in self.poses[0]['raw_deg'])} "
-                      "raw deg).\napp.py refuses to arm until every joint is within "
-                      f"{REFERENCE_TOLERANCE_DEG:.0f} deg of that.\n")
+            self.emit("Next: at teleop, put the leader in the same pose as the arm "
+                      f"(within {ANCHOR_TOLERANCE_DEG:.0f} deg on every joint), then press "
+                      "a to arm.\npose 1 above is the reference those offsets came from, "
+                      "not a pose the session has to start in.\n")
         else:
             self.emit("\n(no --map given; nothing written)\n")
         self.finished = True

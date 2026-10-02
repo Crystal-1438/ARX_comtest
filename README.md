@@ -245,7 +245,7 @@ bash scripts/run.sh --mode teleop --backend mock \
 | `frame.target_rad` | 经映射后真正要发给机械臂的六维目标 |
 | `frame.host_monotonic` | 该帧的解析时刻；**它不动就说明流停了**（值会保留，不会变空） |
 | `map_source` / `calibrated` | 实际加载的标定文件；`<uncalibrated default>` 表示没有标定 |
-| `reference` | 起始帧与 map 记录的基准姿态的比对；见下节 |
+| `anchor` | 按 `a` 那一刻的整圈锚定结果：挑中的整圈、剩下的物理差、`ok`。没 anchor 过时是 `null`；见下节 |
 | `error` | 本批被判为故障的原因 |
 
 `frames` 与 `seq` 不是一回事：`seq` 每个控制周期最多加一，跟的是控制循环；
@@ -265,20 +265,22 @@ bash scripts/run.sh --mode teleop --backend mock \
 按键先于同批串口帧处理，所以本地停止不会被同一批的目标盖过。
 FAULT 后必须先按 `s` 再按 `a`，与线协议恢复语义一致。
 
-`a` 有一个前置条件：**至少要收到过一帧，且这一帧要落在 map 记录的基准姿态附近**。
-不满足就不会 arm，`reason` 里逐关节写出**要转到哪儿**和**为什么**，机械臂一个目标都不会收到：
+`a` 有一个前置条件：**至少要收到过一帧，而且 leader 和机械臂得在同一个姿态（30° 以内）**。
+意思是**用手把 leader 摆成机械臂现在的样子**，再按 `a`。不满足就不会 arm，
+`reason` 里逐关节写出**要转到哪儿**和**为什么**，机械臂一个目标都不会收到：
 
 ```
-refusing to arm: the leader is not in the calibrated pose: J2 reads 14.2 deg and has to
-read 322.8 (turn it -51.4 deg); J5 reads 41.3 deg and has to read 309.7 (turn it -91.6
-deg). Arming here would command J2 -308.6 deg away from where it belongs and J5 -268.4
-deg away from where it belongs (tolerance 10 deg). Put the leader in that pose and restart
+refusing to arm: the leader and the arm are not in the same pose: J2 reads 14.2 deg where
+the arm's pose calls for 322.8 (turn it -51.4 deg); J5 reads 41.3 deg where the arm's pose
+calls for 309.7 (turn it -91.6 deg). Arming here would move J2 -51.4 deg and J5 +91.6 deg
+(tolerance 30 deg). Hand-match the leader to the arm and press a again
 ```
 
-注意这是**两个不同的数**，别混：`turn it -51.4 deg` 是你要转多少（最短圈，符号是方向），
-而 `-308.6 deg away` 是**机械臂会被命令偏多少**——mapper 在第一帧令 `continuous = raw`，
-所以误差就是字面差，单圈编码器只看得到读数，`-51.4` 那一转落地后读数正好是 322.8。
-判据用的是后者，见下面「基准姿态」一节。
+两个数**等大**，方向各自与关节的 `sign` 有关：`turn it -51.4 deg` 是**你要转的**
+（最短圈，符号是方向），`move J2 -51.4 deg` 是**真按下去机械臂会走的**（J2 的 `sign`
+是 −1，所以两者同向；`sign` 为 +1 的 J5 就是 `turn it -91.6` 对 `move +91.6`）。
+按 `a` 的瞬间给每个关节定了一整圈（2π 的整数倍）的偏置，把单圈编码器看不出的圈数补上，
+之后一直带着它映射——所以 `0/360` 的另一侧不再是问题，见下面「按 `a` 时的整圈锚定」一节。
 
 ### 标定：接实机之前必须做
 
@@ -294,9 +296,9 @@ leader 报的是**单圈绝对角**，没有自己的零点。要变成关节弧
 - **多点拟合（慢，但由数据自证）**：摆 3~4 个姿态按 `f`，方向和零位都由数据解出。
   斜率必须≈±1 才写文件。适合单点那条路复核不过、或者你不想靠肉眼判断的时候。
 
-两条路都要求**第一个姿态是基准姿态**：遥操作的展开是从进程收到的第一帧数圈数的，
-所以每次遥操作都要把 leader 摆在基准姿态再启动程序。工具把这个姿态的**原始角度**写进
-`reference_deg`，运行期由程序替你核对（见下）。
+两条路都要有**一个**姿态作为基准（拟合的那条是第一个），因为它把零位钉死：
+offset 是"在这个姿态上"解出来的。工具把这个姿态的**原始角度**写进 `reference_deg`。
+它只是**出处记录**——遥操作不必从这个姿态启动，运行时由机械臂自己的反馈定圈数（见下）。
 
 命令不 arm、不发目标。**加了 `--arm` 就会让机械臂进重力补偿**（状态 3）：电机主动托住自身重量，
 所以你可以用手摆姿势、松手它也不掉——这是标定能单手做的原因。**它是通电驱动状态，不是失能**，
@@ -372,7 +374,7 @@ bash scripts/calibrate.sh session --arm --model 2023 --can-port can0 \
 ```bash
 # 非交互：每个姿态一条命令。--arm 在同一进程里进重力补偿、取一次手臂角度，
 # 因为这里没有终端可以问，命令结束时会自动交回 SOFT 并打印说明（机械臂会落到支撑上）。
-# 第一个姿态是基准姿态，后面必须从它开始。
+# 第一个姿态会作为 reference_deg 记进 map（出处记录），之后的遥操作不必从它启动。
 bash scripts/calibrate.sh sample --arm --model 2023 --can-port can0 \
   --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00 \
   --label "pose A"
@@ -397,37 +399,42 @@ bash scripts/calibrate.sh fit calibration_session.jsonl --out leader_map.json
 写了 `"calibrated": true`；解码器发不出 `arm`/`stop` 而 `--operator-keys` 又没开时同样拒绝。
 `JsonLineDecoder` 不声明这两个属性，因此原有硬件路径不受影响。
 
-### 基准姿态：为什么必须有，以及程序怎么替你查
+### 按 `a` 时的整圈锚定：编码器看不出圈数，机械臂看得出
 
-生成的 `leader_map.json` 里记了 `reference_deg`——**基准姿态的原始角度**。
-展开是从进程收到的第一帧开始数圈数的，而 offset 是"在基准姿态上"解出来的，
-两者的起点必须重合，所以**每次遥操作都要把 leader 摆在那个姿态再启动程序**。
+leader 是**单圈绝对编码器**：一个关节转到哪个圈，读数都落在 `0..359.9` 里，
+所以 `14.2` 和 `374.2` 是**同一个读数**。要发关节弧度就必须知道它在哪一圈，
+而这件事**在 leader 这一侧无解**——线里根本没有这个信息。
 
-起点不重合的后果不是"报错"，而是**机械臂自己走**：整个映射被平移了那么多，
-所以差多少、它就朝那个方向走多少。基准姿态上这套映射完全正确，离开它就整个偏掉，
-而偏掉之后的目标位置对关节限位来说是个完全正常的位置，控制环里没有任何东西能看出不对。
+机械臂的实测关节角是唯一能补上它的东西，所以补的时机就是按 `a` 那一刻：
 
-所以运行期会核对：**第一帧**与 `reference_deg` 逐关节比较，任何一个关节超出
-`REFERENCE_TOLERANCE_DEG`（10°）就拒绝 arm，并把**所有**不合格的关节列出来
-（只报最差的一个会让人修完 J2 重启、再被告知 J5 也不合格）。
-比较用的是**直接相减**而不是最近圈——`0/360` 的另一侧只差 10° 物理角，
-读数却是 350°，而 mapper 也只能按 350° 去发（这时候它还没有历史可以展开）。
-`leader.reference` 里能看到每关节的差值和 `ok`。
+1. 把机械臂实测的每个关节角**反解**成 leader 该读的角（`needed = (arm_deg − offset) / sign`）；
+2. 每个关节挑一个**整圈**（360° 的整数倍）偏置，让 leader 的读数离 `needed` 最近；
+3. 记下这个偏置，之后每帧都带着它映射，**直到退出遥操作模式**。
 
-拒绝信息里同时给两个数，因为它们回答的是不同的问题，而且大小可能差很远：
+于是判据是剩下那点**物理差**（`residual`，恒在 ±180° 内），超过
+`ANCHOR_TOLERANCE_DEG`（30°）就拒绝，并把**所有**不合格的关节列出来——只报最差的一个
+会让人修完 J2 重按、再被告知 J5 也不合格。`leader.anchor` 里能看到整圈偏置、
+每关节的残差、最差关节和 `ok`。
 
-- `turn it -51.4 deg`——**你要转多少**，最短圈，符号是方向（这里的负号指读数变小、
-  经过 0）。`leader_map.shortest_turn()` 算的就是这个，只用于给人看。
-- `-308.6 deg away from where it belongs`——**机械臂会被命令偏多少**，就是字面差。
-  同一个关节可以只差 51.4° 而这里写成 308.6°，因为单圈编码器只报一个数，
-  而 mapper 在第一帧只能照那个数去发。判据用的是这个，不用最短圈：否则
-  "基准 354°、现在 4°"这种只差 10° 物理角的情形会被放过去，而它实际会命令 −350°。
+这带来一个**操作指令上的变化**：前提不再是"把 leader 摆回 map 记的那个姿态"，
+而是**"把 leader 摆成和机械臂一样"**——后者才是遥操作真正需要的前提，而且对任何
+机械臂姿态都成立。`reference_deg` 退化成**出处记录**（offset 是在那个姿态上量的），
+运行期不再用它判定。
 
-**在收到第一帧之前按 `a` 同样被拒绝**：否则先按键的人就绕过了这个检查。
+判据从"字面差"换成"残差"这件事本身就是要解决的问题：以前 `0/360` 另一侧只差
+10° 物理角、读数却是 350°，会按 350° 拒绝（而那时 mapper 也确实只能按 350° 发）。
+现在整圈偏置把那 360° 吃掉了，只剩下那真实的几十度，两个数**大小相等**——差异全在
+符号上，而符号由该关节的 `sign` 决定：
 
-`reference_deg` 缺失（早于这个字段、或手写的 map）时会照常运行，但
-`leader.reference` 会是 `{"checked": false, ...}`——**表示没查过，不是查过没问题**。
-`leader_calibrate.py` 生成的文件都带这个字段。
+- `turn it -51.4 deg`——**你要转多少**，最短圈，符号是方向。`leader_map.shortest_turn()`。
+- `move J2 -51.4 deg`——**真按下去机械臂会走多少**，即 `sign * residual`。两者等大，
+  同号还是反号看该关节的 `sign`（J2 是 −1，同号；J5 是 +1，反号）。
+
+**在收到第一帧之前按 `a` 同样被拒绝**（此时没有读数可以定圈，硬猜等于盲发目标）。
+
+**这条门禁装在 `Controller` 的 arm 转移上，不是装在按键处理里**：进 ACTIVE 有两条路
+（串口帧里的 `arm`，和本地按键），只堵一条等于没堵。解码器只要提供 `anchor` 方法
+就会被装成 `pre_arm`；`JsonLineDecoder` 没有，行为一字不变。
 
 已知缺口，接实机前必须处理：文档 §2 说编码器采到过数据后又断开会**冻结在最后一个有效值**，
 `-1` 判据抓不到这种坏法；值域内的静默错误（`2117 → 2717`）也抓不到。

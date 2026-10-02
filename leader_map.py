@@ -11,8 +11,10 @@ Those live in a calibration file. Until it is filled in and marked
 placeholder -- see ``LeaderMap.calibrated`` and the gate in ``app.py``.
 
 The offsets are only true at the pose they were measured at, so the map also
-records that pose's raw angles in ``reference_deg``, and ``check_reference``
-compares a session's first frame against it.
+records that pose's raw angles in ``reference_deg``. That field is provenance
+now, not a gate: the encoder reports one number per turn, so it cannot say which
+turn it is on, and the pose the arm is actually in is the only thing that can.
+``resolve_turns`` picks the whole turns from it when the operator arms.
 """
 
 from dataclasses import dataclass
@@ -26,10 +28,14 @@ ENV_VAR = "ARX_LEADER_MAP"
 JOINTS = 6
 FIELDS = ("sign", "offset_deg", "unwrap")
 TOP_FIELDS = frozenset({"calibrated", "joints", "comment", "reference_deg"})
-# How far a session's first frame may sit from the calibrated pose before
-# driving from it is a mistake. The offset it produces is a walk the arm makes
-# unasked, so this is a small number: see check_reference.
-REFERENCE_TOLERANCE_DEG = 10.0
+# How far the leader and the arm may be apart, measured as a physical distance,
+# when the operator arms. Past it the two are not in the same pose and the
+# leader's first command would be a jump, so the arm is not enabled: see
+# resolve_turns. Wider than the old 10 was, because this is now a hand-placement
+# tolerance on two things a person lines up rather than a repeat of a stored
+# number -- and because whole-turn bias removes the 0/360 disproportion that
+# made the old one fire on a few degrees.
+ANCHOR_TOLERANCE_DEG = 30.0
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,15 @@ class JointMap:
     offset_deg: float = 0.0
     unwrap: bool = True
 
+    def from_arm_deg(self, arm_deg):
+        """The leader angle this joint's arm angle corresponds to.
+
+        The inverse of the mapping above, and kept next to it so a change to one
+        is visible from the other. ``sign`` is only ever 1 or -1, so dividing by
+        it is the same as multiplying.
+        """
+        return (arm_deg - self.offset_deg) / self.sign
+
 
 @dataclass(frozen=True)
 class LeaderMap:
@@ -47,7 +62,9 @@ class LeaderMap:
     calibrated: bool = False
     source: str = "<uncalibrated default>"
     # The raw leader angles at the pose the offsets were measured at, or None
-    # for a map written before that was recorded. See check_reference.
+    # for a map written before that was recorded. Provenance: it says where the
+    # offsets come from and is what a calibration run reproduces. Nothing gates
+    # on it any more -- see resolve_turns for what replaced the check.
     reference_deg: tuple = None
 
 
@@ -107,8 +124,8 @@ def _reference(value):
     angles = tuple(_number(angle, f"reference_deg[{index}]")
                    for index, angle in enumerate(value))
     # A raw angle exists only within one turn of the encoder. Anything else is a
-    # degrees/radians mix-up rather than a pose, and would make the startup
-    # check pass or fail for the wrong reason.
+    # degrees/radians mix-up rather than a pose, and would record a wrong
+    # provenance for offsets that are otherwise fine.
     if any(not 0.0 <= angle < 360.0 for angle in angles):
         raise ValueError("reference_deg angles must be within 0..360")
     return angles
@@ -144,47 +161,56 @@ def load_mapping(path):
 def shortest_turn(reference_deg, raw_deg):
     """How far to turn a joint to get from where it reads to where it must read.
 
-    Guidance for whoever is moving the leader, and deliberately not a verdict.
-    On a single-turn encoder these two quantities are different sizes: a joint
-    tens of degrees from the reference reads as hundreds of degrees away, and
-    the large one is what the arm will be commanded (see ``check_reference``).
-    Both are worth saying -- one is the reason to refuse, the other is the
-    thing to do about it -- but they must not be confused, so they live in
-    separate functions with the sign carrying the direction of the turn.
+    Guidance for whoever is moving the leader, and deliberately not a verdict:
+    it is the shortest way round, which is what a hand can act on. The verdict
+    is ``resolve_turns``, and the two agree on the size of the move once the
+    whole-turn bias is in (see the test that pins them together) -- but they
+    are separate functions because the sign is a direction for a person and a
+    command for the mapper, and those get read differently.
     """
     return ((reference_deg - raw_deg + 180.0) % 360.0) - 180.0
 
 
-def check_reference(reference_deg, raw_deg, tolerance=REFERENCE_TOLERANCE_DEG):
-    """How far a session's first frame sits from the pose the map was made at.
+def resolve_turns(continuous_deg, needed_deg, tolerance=ANCHOR_TOLERANCE_DEG):
+    """Which whole turn of each encoder belongs to the pose the arm is in.
 
-    The offsets mean ``arm_deg - sign * raw_deg`` at the reference pose, and
-    ``Mapper`` starts unwrapping from whatever the first frame reads. So a
-    session that starts anywhere else shifts every target by the same amount,
-    and the arm walks off by exactly that the moment it is armed. Nothing else
-    in the loop can notice: the shifted position is an ordinary pose, inside the
-    joint limits for any shift under a turn.
+    A single-turn encoder reports one number for every turn a joint can be on,
+    so 14.2 and 374.2 are the same reading and the leader alone cannot say which
+    one is meant. The arm's measured pose can: it is the only thing in the loop
+    that knows how many turns have gone by. This picks, per joint, the whole
+    number of turns that puts the leader's reading closest to the angle that
+    pose corresponds to, and reports what is left over.
 
-    The difference is taken literally rather than the short way round, because
-    the wrap is not the small step it looks like here. Ten degrees past the
-    reference on the other side of the 0/360 rollover reads as 350 degrees away
-    -- and 350 degrees is what the mapper will command, because unwrapping only
-    starts once this first frame has fixed the origin. So the literal
-    difference *is* the commanded error, and the tolerance is applied to it.
-    ``shortest_turn`` is the same pair of angles measured as a physical move;
-    it belongs in the message to the operator, never in this verdict.
+    That leftover is a physical distance -- never more than half a turn, since
+    the bias absorbs the rest -- and it is also the move the arm will be
+    commanded to make on the next frame, once the bias is applied and ``sign``
+    has flipped it. So the verdict is taken on the leftover. Taking it on the
+    literal difference instead is what made a joint sitting a few degrees past
+    the 0/360 rollover look like it was hundreds of degrees out.
+
+    ``continuous_deg`` is what the mapper has unwrapped so far, one entry per
+    joint, or None for a joint no frame has reached yet. That is the one case
+    that cannot be answered, and it raises rather than guessing: there is no
+    reading to bias.
     """
-    if len(reference_deg) != JOINTS or len(raw_deg) != JOINTS:
+    if len(continuous_deg) != JOINTS or len(needed_deg) != JOINTS:
         raise ValueError(f"expected {JOINTS} angles")
-    offsets = [now - reference for reference, now in zip(reference_deg, raw_deg)]
-    worst = max(range(JOINTS), key=lambda index: abs(offsets[index]))
+    turns = []
+    residual = []
+    for now, needed in zip(continuous_deg, needed_deg):
+        if now is None:
+            raise ValueError("no leader frame has arrived yet")
+        turn = 360.0 * round((needed - now) / 360.0)
+        turns.append(turn)
+        residual.append(now + turn - needed)
+    worst = max(range(JOINTS), key=lambda index: abs(residual[index]))
     return {
-        "checked": True,
-        "ok": abs(offsets[worst]) <= tolerance,
+        "ok": abs(residual[worst]) <= tolerance,
         "tolerance_deg": tolerance,
         "worst_joint": worst,
-        "worst_deg": offsets[worst],
-        "offsets_deg": offsets,
+        "worst_deg": residual[worst],
+        "turns_deg": turns,
+        "residual_deg": residual,
     }
 
 
@@ -194,14 +220,40 @@ class Mapper:
     Unwrapping can only be relative to where the stream started: the encoder
     has no notion of which turn it is on. So this is a position *offset*
     estimator, not an absolute reference.
+
+    Which turn the stream *started* on is the same ambiguity one level up, and
+    ``continuous`` cannot answer it either. ``anchor`` sets a whole-turn bias
+    from the arm's measured pose to resolve it; until then the bias is zero and
+    the mapping is the one the calibration run recorded.
     """
 
     def __init__(self, mapping):
         self.mapping = mapping
         self.continuous = [None] * JOINTS
+        # Whole turns (multiples of 360) added to ``continuous`` before the
+        # mapping. Kept apart from ``continuous`` on purpose: that one is the
+        # unwrapped encoder reading, which the calibration tool samples and
+        # which must stay a faithful record of the wire.
+        self.bias = [0.0] * JOINTS
 
     def reset(self):
+        """Forget the unwrap origin. The bias goes with it: it was chosen
+        relative to that origin, so carrying it over would be worse than zero."""
         self.continuous = [None] * JOINTS
+        self.bias = [0.0] * JOINTS
+
+    def anchor(self, needed_deg, tolerance=ANCHOR_TOLERANCE_DEG):
+        """Fix the whole-turn bias from the arm's pose. See ``resolve_turns``.
+
+        Returns the verdict either way: a refusal still has to say which joints
+        are out and by how much. The bias is only written when the verdict
+        passes, so a session that is refused carries nothing over to the next
+        attempt.
+        """
+        verdict = resolve_turns(self.continuous, needed_deg, tolerance)
+        if verdict["ok"]:
+            self.bias = list(verdict["turns_deg"])
+        return verdict
 
     def to_radians(self, degrees):
         if len(degrees) != JOINTS:
@@ -214,5 +266,6 @@ class Mapper:
                 # documented in docs/uart_packet.md becomes +0.1, not -359.8.
                 angle = previous + ((angle - previous + 180.0) % 360.0) - 180.0
             self.continuous[index] = angle
-            result.append(math.radians(joint.sign * angle + joint.offset_deg))
+            result.append(math.radians(
+                joint.sign * (angle + self.bias[index]) + joint.offset_deg))
         return tuple(result)

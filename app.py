@@ -137,21 +137,21 @@ def check_decoder_for_hardware(decoder, operator_keys):
             "arm and to clear a latched fault; add --operator-keys")
 
 
-def apply_operator_arm(controller, decoder, now):
-    """Arm on the operator's key, unless the decoder says this session is bad.
+def install_arm_check(controller, decoder):
+    """Let a decoder veto enabling the arm, and hand it the measured position.
 
-    The leader decoder fixes its unwrap origin on the first frame, so a session
-    that started away from the calibrated pose is off by that much on every
-    joint and cannot be corrected from here. Refusing leaves the reason on the
-    readout instead of walking the arm. Only the operator path needs this: a
-    decoder that can send ARM itself has to declare it, and this one declares it
-    cannot (``provides_arm``), which is what --operator-keys is for.
+    The leader decoder needs this: a single-turn encoder cannot say which turn
+    it is on, so the whole-turn bias it carries has to be chosen against the
+    pose the arm is actually in, and the moment just before the arm is enabled
+    is the only time both readings are on hand. A decoder that says nothing
+    about itself (``JsonLineDecoder``) has no such hook and is unaffected.
+
+    This is a controller-level check rather than one on the operator's key
+    because ARM reaches the controller by two routes -- the wire, and the local
+    key -- and a decoder that emits ARM frames has to be held to the same check
+    as an operator who presses the key.
     """
-    blocker = getattr(decoder, "startup_blocker", None)
-    if blocker and controller.state == "STOPPED":
-        controller.stop(f"refusing to arm: {blocker}")
-    else:
-        controller.operator_arm(now)
+    controller.pre_arm = getattr(decoder, "anchor", None)
 
 
 def emit(controller, joints, backend, decoder=None):
@@ -210,6 +210,7 @@ def run(args):
         arm = (VendorArm(args.sdk_root, args.can_port, args.model, args.stop_mode)
                if hardware else MockArm(args.stop_mode))
         controller = Controller(arm, limits, time.monotonic())
+        install_arm_check(controller, decoder)
         started = time.monotonic()
         next_tick = next_print = started
         previous_state = None
@@ -223,7 +224,9 @@ def run(args):
                 # wire frames already sitting in this iteration's buffer.
                 for action in operator.poll():
                     if action == "arm":
-                        apply_operator_arm(controller, decoder, time.monotonic())
+                        # Goes through the same pre_arm check as the wire's ARM,
+                        # installed above.
+                        controller.operator_arm(time.monotonic())
                     else:
                         controller.operator_stop()
             if source:

@@ -4,9 +4,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from leader_map import (JOINTS, JointMap, LeaderMap, Mapper,
-                        REFERENCE_TOLERANCE_DEG, check_reference, load_mapping,
-                        resolve_mapping_path, shortest_turn, uncalibrated)
+from leader_map import (ANCHOR_TOLERANCE_DEG, JOINTS, JointMap, LeaderMap, Mapper,
+                        load_mapping, resolve_mapping_path, resolve_turns,
+                        shortest_turn, uncalibrated)
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "leader_map.example.json"
 
@@ -105,76 +105,110 @@ class ValidationTests(unittest.TestCase):
                 self.reject(dict(valid(), reference_deg=broken))
 
 
-class ReferenceTests(unittest.TestCase):
-    """The map is only true at the pose it was measured at, and this is the
-    check that a session started there."""
+class ResolveTurnsTests(unittest.TestCase):
+    """Which turn of the encoder each joint is on, as decided from the arm.
 
-    REFERENCE = [79.5, 328.1, 106.0, 235.3, 287.5, 208.5]
+    The encoder gives one number per turn, so this is the step that has to
+    choose; everything about a session's start pose being "wrong" came from not
+    having it.
+    """
 
-    def check(self, raw, reference=None):
-        return check_reference(self.REFERENCE if reference is None else reference, raw)
+    READ = [79.5, 328.1, 106.0, 235.3, 287.5, 208.5]
 
-    def test_the_reference_pose_itself_is_accepted(self):
-        result = self.check(self.REFERENCE)
+    def resolve(self, needed, read=None, **overrides):
+        return resolve_turns(self.READ if read is None else read, needed, **overrides)
+
+    def test_the_pose_it_already_reads_needs_no_turn(self):
+        result = self.resolve(self.READ)
         self.assertTrue(result["ok"])
-        self.assertEqual(result["offsets_deg"], [0.0] * JOINTS)
+        self.assertEqual(result["turns_deg"], [0.0] * JOINTS)
+        self.assertEqual(result["residual_deg"], [0.0] * JOINTS)
 
-    def test_a_small_hand_placement_error_is_accepted(self):
-        raw = [value + 1.0 for value in self.REFERENCE]
-        self.assertTrue(self.check(raw)["ok"])
+    def test_a_pose_on_the_far_side_of_the_rollover_is_not_hundreds_off(self):
+        # The case this whole change is for: the leader sits at 4.0 where the
+        # arm's pose corresponds to 354.0 -- ten degrees apart, but the literal
+        # difference is -350. A whole turn of bias absorbs the wrap, so what is
+        # left over is the ten degrees and the verdict is taken on that.
+        read = [4.0, 328.1, 106.0, 235.3, 287.5, 208.5]
+        needed = [354.0, 328.1, 106.0, 235.3, 287.5, 208.5]
+        result = self.resolve(needed, read)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["turns_deg"][0], 360.0)
+        self.assertAlmostEqual(result["residual_deg"][0], 10.0)
 
-    def test_the_offset_it_reports_is_the_walk_the_arm_would_make(self):
-        raw = list(self.REFERENCE)
-        raw[2] += 90.0
-        result = self.check(raw)
+    def test_the_turn_it_picks_is_always_a_whole_number_of_turns(self):
+        for shift in (0.0, 360.0, 720.0, -360.0):
+            with self.subTest(shift=shift):
+                result = self.resolve([value + shift for value in self.READ])
+                self.assertTrue(result["ok"])
+                for turn in result["turns_deg"]:
+                    self.assertEqual(turn % 360.0, 0.0)
+
+    def test_a_joint_further_than_the_tolerance_is_refused(self):
+        needed = list(self.READ)
+        needed[2] += ANCHOR_TOLERANCE_DEG + 1.0
+        result = self.resolve(needed)
         self.assertFalse(result["ok"])
         self.assertEqual(result["worst_joint"], 2)
-        self.assertAlmostEqual(result["worst_deg"], 90.0)
 
-    def test_a_difference_just_over_the_tolerance_fails(self):
-        raw = list(self.REFERENCE)
-        raw[0] += REFERENCE_TOLERANCE_DEG + 0.5
-        self.assertFalse(self.check(raw)["ok"])
+    def test_a_difference_right_at_the_tolerance_is_allowed(self):
+        needed = list(self.READ)
+        needed[0] += ANCHOR_TOLERANCE_DEG
+        self.assertTrue(self.resolve(needed)["ok"])
 
-    def test_the_wrap_is_not_a_small_step(self):
-        # Ten degrees past the reference on the far side of 0/360 reads as 350
-        # away, and 350 is what the mapper would command: it takes this first
-        # frame as its origin, so there is no history to unwrap against yet.
-        # Shortest-path arithmetic here would wave the session through.
-        result = self.check([4.0, 328.1, 106.0, 235.3, 287.5, 208.5],
-                            reference=[354.0, 328.1, 106.0, 235.3, 287.5, 208.5])
-        self.assertFalse(result["ok"])
-        self.assertAlmostEqual(result["worst_deg"], -350.0)
+    def test_the_residual_is_the_shortest_turn_the_other_way_round(self):
+        # Two functions, one number. The verdict is what the arm would be
+        # commanded and the turn is what the hand has to do, and if they ever
+        # disagree the refusal message tells the operator to do one thing while
+        # the arm does another. Checked across the rollover in both directions
+        # and at the whole-turn boundaries, where the two are the same size and
+        # may differ by exactly a turn.
+        for offset in (-170.0, -90.0, -1.0, 0.0, 1.0, 90.0, 179.0, 180.0, 181.0):
+            with self.subTest(offset=offset):
+                needed = [value + offset for value in self.READ]
+                result = self.resolve(needed)
+                for index, now in enumerate(self.READ):
+                    # Modulo a turn, folded into (-180, 180] so the comparison
+                    # does not trip on the wrap itself.
+                    apart = (result["residual_deg"][index]
+                             + shortest_turn(needed[index], now))
+                    self.assertAlmostEqual((apart + 180.0) % 360.0 - 180.0, 0.0, places=6)
 
-    def test_the_reported_joint_is_the_worst_one(self):
-        raw = list(self.REFERENCE)
-        raw[1] -= 40.0
-        raw[4] += 120.0
-        self.assertEqual(self.check(raw)["worst_joint"], 4)
+    def test_the_residual_never_exceeds_half_a_turn(self):
+        for offset in (-540.0, -359.0, 359.0, 540.0, 4000.0):
+            with self.subTest(offset=offset):
+                for residual in self.resolve([value + offset for value in self.READ])["residual_deg"]:
+                    self.assertLessEqual(abs(residual), 180.0 + 1e-9)
+
+    def test_a_joint_with_no_frame_yet_is_not_guessed(self):
+        # run before any frame: there is no reading to bias, and inventing one
+        # would arm the arm on a pose nobody has seen.
+        with self.assertRaises(ValueError):
+            self.resolve(self.READ, read=[None] + self.READ[1:])
 
     def test_refuses_angles_that_are_not_six_joints(self):
         with self.assertRaises(ValueError):
-            self.check(self.REFERENCE[:5])
+            self.resolve(self.READ[:5])
 
 
 class ShortestTurnTests(unittest.TestCase):
-    """The turnover the operator has to do, which is not the verdict.
+    """The one-signed-angle form of the same distance ``resolve_turns`` reports.
 
-    ``check_reference`` measures the literal difference because that is what the
-    arm gets commanded; these are the same two angles measured as a physical
-    move. Keeping them apart is deliberate -- see the docstrings -- so they get
-    their own tests rather than being folded into the verdict's.
+    The verdict and this function answer different questions -- the residual is
+    what the arm walks to meet the leader, the turn is how far the hand has to
+    move to meet it -- but both are shortest-turn distances, and ``ResolveTurnsTests``
+    pins them to each other. What is tested here is only the angle: single
+    signed value, never more than half a turn, zero when the two agree.
     """
 
     def test_a_short_move_the_other_way_is_short(self):
         # 322.8 and 14.2 are 51.4 apart going down through zero, and 308.6 the
-        # other way. The verdict says 308.6; the turn has to say 51.4.
+        # other way. The hand only ever has to travel the 51.4.
         self.assertAlmostEqual(shortest_turn(322.8, 14.2), -51.4, places=6)
 
     def test_it_is_the_short_way_round_the_rollover(self):
-        # Ten degrees past the reference, but the reading rolled over: the
-        # verdict is -350 (that is what the arm would be told) and the turn is
-        # ten degrees (that is what the hand has to do).
+        # Ten degrees apart across the 0/360 seam, not 350: the encoder cannot
+        # tell the two apart and neither may this.
         self.assertAlmostEqual(shortest_turn(354.0, 4.0), -10.0, places=6)
         self.assertAlmostEqual(shortest_turn(4.0, 354.0), 10.0, places=6)
 
@@ -218,6 +252,84 @@ class MapperTests(unittest.TestCase):
         mapper.to_radians([355.0] * JOINTS)
         mapper.reset()
         self.assertAlmostEqual(mapper.to_radians([5.0] * JOINTS)[0], math.radians(5.0))
+
+    def test_from_arm_deg_inverts_the_mapping(self):
+        for sign in (1.0, -1.0):
+            for offset in (0.0, 90.0, -75.5):
+                with self.subTest(sign=sign, offset=offset):
+                    joint = JointMap(sign=sign, offset_deg=offset)
+                    self.assertAlmostEqual(
+                        sign * joint.from_arm_deg(30.0) + offset, 30.0)
+
+
+class AnchorTests(unittest.TestCase):
+    """Fixing the whole turn from the arm's pose, and carrying it after that."""
+
+    READ = [79.5, 328.1, 106.0, 235.3, 287.5, 208.5]
+
+    def mapper(self):
+        return Mapper(LeaderMap(joints=(JointMap(),) * JOINTS, calibrated=True))
+
+    def anchored(self, mapper=None):
+        mapper = mapper or self.mapper()
+        mapper.to_radians(self.READ)
+        return mapper, mapper.anchor(self.READ)
+
+    def test_an_unanchored_mapper_is_the_plain_mapping(self):
+        mapper = self.mapper()
+        self.assertEqual(mapper.bias, [0.0] * JOINTS)
+        self.assertAlmostEqual(mapper.to_radians([100.0] * JOINTS)[0], math.radians(100.0))
+
+    def test_anchoring_a_pose_that_matches_changes_nothing(self):
+        mapper, verdict = self.anchored()
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(mapper.bias, [0.0] * JOINTS)
+        self.assertAlmostEqual(mapper.to_radians([100.0] * JOINTS)[0], math.radians(100.0))
+
+    def test_the_bias_carries_the_stream_past_the_rollover(self):
+        # The session starts reading 4.0 where the arm's pose calls for 354.0. Without
+        # the bias the next sample, 5.0, maps to 5.0 and the arm is commanded
+        # -349 from where it should be; with it, the stream continues from 364.
+        mapper = self.mapper()
+        mapper.to_radians([4.0] * JOINTS)
+        self.assertTrue(mapper.anchor([354.0] * JOINTS)["ok"])
+        self.assertAlmostEqual(mapper.to_radians([5.0] * JOINTS)[0], math.radians(365.0))
+
+    def test_the_bias_leaves_the_unwrapped_reading_alone(self):
+        # ``continuous`` is what the calibration tool samples and what the wire
+        # is compared against; the bias is a separate term.
+        mapper, _ = self.anchored()
+        mapper.to_radians([5.0] * JOINTS)
+        self.assertAlmostEqual(mapper.continuous[0], 5.0)
+
+    def test_a_refused_anchor_writes_no_bias(self):
+        mapper = self.mapper()
+        mapper.to_radians(self.READ)
+        verdict = mapper.anchor([value + 90.0 for value in self.READ])
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(mapper.bias, [0.0] * JOINTS)
+
+    def test_a_refusal_does_not_disturb_an_earlier_bias(self):
+        mapper = self.mapper()
+        mapper.to_radians(self.READ)
+        mapper.anchor([value + 360.0 for value in self.READ])
+        self.assertEqual(mapper.bias, [360.0] * JOINTS)
+        self.assertFalse(mapper.anchor([value + 90.0 for value in self.READ])["ok"])
+        self.assertEqual(mapper.bias, [360.0] * JOINTS)
+
+    def test_reset_takes_the_bias_with_it(self):
+        # The bias was chosen against an origin that no longer exists, so
+        # carrying it over would be a mapping nobody has checked.
+        mapper = self.mapper()
+        mapper.to_radians(self.READ)
+        mapper.anchor([value + 360.0 for value in self.READ])
+        mapper.reset()
+        self.assertEqual(mapper.bias, [0.0] * JOINTS)
+        self.assertAlmostEqual(mapper.to_radians([5.0] * JOINTS)[0], math.radians(5.0))
+
+    def test_anchoring_before_any_frame_raises(self):
+        with self.assertRaises(ValueError):
+            self.mapper().anchor([0.0] * JOINTS)
 
 
 if __name__ == "__main__":

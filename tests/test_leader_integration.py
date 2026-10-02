@@ -6,6 +6,7 @@ works together before any of it is pointed at real motors.
 """
 
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -31,11 +32,39 @@ WIDE_LIMITS = {"lower": [-6.3] * 6, "upper": [6.3] * 6,
                "max_speed": 2.0, "max_following_error": 0.5, "timeout": 0.25}
 
 
+def leader_frame(record):
+    """The leader's last frame, or an empty dict while there is none yet.
+
+    The telemetry block is present as soon as the first report is printed but
+    the frame inside it starts as None, so every read of it has to get past
+    that before touching a field.
+    """
+    return (record.get("leader") or {}).get("frame") or {}
+
+
+def mapping_from(reference, inverted=(0,)):
+    """A map that puts the mock arm's rest pose (all zeroes) at ``reference``.
+
+    Arming now requires the leader and the arm to be in the same pose, and the
+    mock arm never moves on its own, so the map has to be built around its
+    zero: with ``needed = (arm_deg - offset) / sign`` and the arm at zero, the
+    offset that makes the leader's reference angles come out is ``-sign * angle``.
+
+    A few joints are inverted, so a passing test proves the mapping is applied
+    and not just that the raw degrees round-tripped.
+    """
+    joints = []
+    for index, angle in enumerate(reference):
+        sign = -1 if index in inverted else 1
+        joints.append({"sign": sign, "offset_deg": -sign * angle, "unwrap": True})
+    return {"calibrated": True, "joints": joints}
+
+
 class LeaderHarness(unittest.TestCase):
     """Runs the app on a pty with a mock arm. Holds no tests of its own.
 
-    The map decides what the gate does, so the groups below share this and
-    differ only in ``mapping_config``.
+    The map decides which pose the arm and the leader have to share, so the
+    groups below share this and differ only in ``mapping_config``.
     """
 
     def setUp(self):
@@ -65,18 +94,7 @@ class LeaderHarness(unittest.TestCase):
         self.wait_for(lambda r: r["state"] == "STOPPED")
 
     def mapping_config(self):
-        """J1 inverted, so a passing test proves the mapping is applied and not
-        just that the raw degrees round-tripped.
-
-        Deliberately without ``reference_deg``: most of these tests are about
-        the state machine, and a map from before that field existed has to keep
-        working. The gate itself is exercised below.
-        """
-        return {
-            "calibrated": True,
-            "joints": [{"sign": -1, "offset_deg": 0.0, "unwrap": True}] +
-                      [{"sign": 1, "offset_deg": 0.0, "unwrap": True}] * 5,
-        }
+        return mapping_from(REFERENCE)
 
     def stop_process(self):
         if self.process.poll() is None:
@@ -149,12 +167,15 @@ class LeaderIntegrationTests(LeaderHarness):
     def test_local_key_arms_and_the_mapping_reaches_the_mock_arm(self):
         self.press_arm()
         self.wait_for(lambda r: r["state"] == "ACTIVE", CAPTURED)
-        # J1 is inverted by the map, so both the decoded target and the arm
-        # the mock reports must be negative.
-        moving = self.wait_for(lambda r: r["joints_rad"][0] < 0, CAPTURED)
+        # J1 is inverted by the map, so a leader angle above the arm's own pose
+        # has to come out as a negative target and the arm has to follow it
+        # down. The arm sits at the reference, so nudging the leader up is what
+        # makes the direction visible.
+        nudged = b"800,3281,1060,2353,2875,2085,500"
+        moving = self.wait_for(lambda r: r["joints_rad"][0] < 0, nudged)
         self.assertEqual(moving["state"], "ACTIVE")
         self.assertLess(moving["leader"]["frame"]["target_rad"][0], 0)
-        self.assertAlmostEqual(moving["leader"]["frame"]["angle_deg"][0], 79.5)
+        self.assertAlmostEqual(moving["leader"]["frame"]["angle_deg"][0], 80.0)
 
     def test_arming_before_the_leader_says_anything_is_refused(self):
         # There is no origin to judge yet, and the first key press must not be a
@@ -202,55 +223,100 @@ class LeaderIntegrationTests(LeaderHarness):
         self.assertEqual(self.process.wait(timeout=3), 0)
 
 
-class ReferenceGateTests(LeaderHarness):
-    """The map records the pose it was measured at, and a session that starts
-    anywhere else would be wrong by that much on every joint. Nothing in the
-    control loop can see that, so the gate has to."""
+class MatchedPoseTests(LeaderHarness):
+    """The leader is in the pose the arm is in, so arming is allowed.
 
-    def mapping_config(self):
-        config = super().mapping_config()
-        config["reference_deg"] = REFERENCE
-        return config
+    The map is the one above, which puts the mock arm's rest pose at CAPTURED,
+    so nothing has to move for the two to agree.
+    """
 
-    def test_a_session_that_started_at_the_reference_is_allowed_to_arm(self):
-        record = self.wait_for(lambda r: r["leader"]["reference"], CAPTURED)
-        self.assertTrue(record["leader"]["reference"]["checked"])
-        self.assertTrue(record["leader"]["reference"]["ok"])
-        self.press(b"a")
-        self.wait_for(lambda r: r["state"] == "ACTIVE", CAPTURED)
+    def test_the_leader_in_the_arm_s_pose_is_allowed_to_arm(self):
+        self.press_arm()
+        record = self.wait_for(lambda r: r["state"] == "ACTIVE", CAPTURED)
+        self.assertTrue(record["leader"]["anchor"]["ok"])
+        self.assertEqual(record["leader"]["anchor"]["turns_deg"], [0.0] * 6)
 
-    def test_the_reference_does_not_have_to_be_exact(self):
-        nudged = b"797,3281,1060,2353,2875,2085,500"  # J1 0.2 deg past it
+    def test_a_hand_placement_error_within_the_tolerance_is_allowed(self):
+        # Half a degree is as close as a hand gets, and the residual it leaves
+        # is what the arm walks to meet the leader -- which is the whole point
+        # of the tolerance being a walk and not a jump.
+        nudged = b"800,3281,1060,2353,2875,2085,500"  # J1 0.5 deg up
         self.press_arm(nudged)
-        self.wait_for(lambda r: r["state"] == "ACTIVE", nudged)
+        record = self.wait_for(lambda r: r["state"] == "ACTIVE", nudged)
+        self.assertAlmostEqual(record["leader"]["anchor"]["residual_deg"][0], 0.5)
 
-
-class OffReferenceTests(LeaderHarness):
-    """Same map, but the session began with J3 a quarter turn out."""
-
-    def mapping_config(self):
-        config = super().mapping_config()
-        config["reference_deg"] = [REFERENCE[0], REFERENCE[1], REFERENCE[2] - 90.0,
-                                   REFERENCE[3], REFERENCE[4], REFERENCE[5]]
-        return config
-
-    def test_arming_is_refused_and_the_readout_says_which_joint(self):
-        record = self.wait_for(lambda r: r["leader"]["reference"], CAPTURED)
-        self.assertFalse(record["leader"]["reference"]["ok"])
-        self.assertEqual(record["leader"]["reference"]["worst_joint"], 2)
-        self.assertEqual(record["state"], "STOPPED")
+    def test_arming_before_the_leader_says_anything_is_refused(self):
         self.press(b"a")
-        record = self.wait_for(lambda r: "refusing to arm" in r["reason"], CAPTURED)
+        record = self.wait_for(lambda r: "refusing to arm" in r["reason"])
+        self.assertEqual(record["state"], "STOPPED")
+
+
+class MismatchedPoseTests(LeaderHarness):
+    """Same map, but the leader is a quarter turn away from where the arm is."""
+
+    AWAY = b"795,3281,1960,2353,2875,2085,500"  # J3 reads 196 where the arm is at 106
+
+    def test_arming_is_refused_and_the_reason_says_which_joint(self):
+        self.press_arm(self.AWAY)
+        record = self.wait_for(lambda r: "refusing to arm" in r["reason"], self.AWAY)
         self.assertEqual(record["state"], "STOPPED")
         self.assertIn("J3", record["reason"])
+        self.assertFalse(record["leader"]["anchor"]["ok"])
+        self.assertEqual(record["leader"]["anchor"]["worst_joint"], 2)
 
     def test_the_arm_is_never_commanded(self):
-        self.press_arm()
-        self.wait_for(lambda r: "refusing to arm" in r["reason"], CAPTURED)
+        self.press_arm(self.AWAY)
+        self.wait_for(lambda r: "refusing to arm" in r["reason"], self.AWAY)
         # Stopped is not enough on its own: nothing may have been written, and
         # the mock arm starts from zero like the leader's own zero would.
         self.assertTrue(all(abs(q) < 1e-9 for r in self.records
                             for q in r.get("joints_rad", [])))
+
+    def test_moving_the_leader_to_the_arm_and_pressing_again_arms(self):
+        # Nothing is latched: the operator lines the two up and tries again.
+        self.press_arm(self.AWAY)
+        self.wait_for(lambda r: "refusing to arm" in r["reason"], self.AWAY)
+        self.wait_for(lambda r: leader_frame(r).get("angle_deg", [None] * 3)[2] == 106.0,
+                      CAPTURED)
+        self.press(b"a")
+        self.wait_for(lambda r: r["state"] == "ACTIVE", CAPTURED)
+
+
+class RolloverTests(LeaderHarness):
+    """The encoder's 0/360 seam, and the whole-turn bias that exists for it.
+
+    The arm's pose corresponds to a leader angle of 354.0 on J1 while the leader
+    reads 4.0: ten degrees apart, but on opposite sides of the seam. Before the
+    bias this session was refused outright as -350 degrees out.
+    """
+
+    BEFORE = [354.0, 328.1, 106.0, 235.3, 287.5, 208.5]
+    AFTER = b"40,3281,1060,2353,2875,2085,500"
+    NEXT = b"50,3281,1060,2353,2875,2085,500"
+
+    def mapping_config(self):
+        return mapping_from(self.BEFORE)
+
+    def test_a_leader_just_past_the_seam_arms_against_an_arm_just_before_it(self):
+        self.press_arm(self.AFTER)
+        record = self.wait_for(lambda r: r["state"] == "ACTIVE", self.AFTER)
+        anchor = record["leader"]["anchor"]
+        self.assertTrue(anchor["ok"])
+        self.assertEqual(anchor["turns_deg"][0], 360.0)
+        self.assertAlmostEqual(anchor["residual_deg"][0], 10.0)
+
+    def test_the_mapping_keeps_going_instead_of_jumping_back_a_turn(self):
+        # 4.0 then 5.0 has to map to 364 then 365, so the arm follows the hand
+        # down past the seam rather than being sent back to 4.
+        self.press_arm(self.AFTER)
+        self.wait_for(lambda r: r["state"] == "ACTIVE", self.AFTER)
+        record = self.wait_for(
+            lambda r: leader_frame(r).get("angle_deg", [None])[0] == 5.0, self.NEXT)
+        # 365 on this inverted joint is -11 deg, which is where the arm is now
+        # heading -- the other side of the seam, the way the hand moved.
+        self.assertAlmostEqual(record["leader"]["frame"]["target_rad"][0],
+                               math.radians(-11.0))
+        self.wait_for(lambda r: r["joints_rad"][0] < -0.19, self.NEXT)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,10 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from app import BUNDLED_SDK, check_decoder_for_hardware, decoder_from_path, load_limits, run
+from app import (BUNDLED_SDK, check_decoder_for_hardware, decoder_from_path,
+                 install_arm_check, load_limits, run)
 from backends import MockArm
+from control import Controller, Limits
 from protocol import Command, JsonLineDecoder, ProtocolError
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -93,6 +95,41 @@ class AppTests(unittest.TestCase):
                                                leader_map=mapping)), 0)
                 # run() exports the override; the decoder reads it at load time.
                 self.assertEqual(os.environ["ARX_LEADER_MAP"], str(mapping))
+
+
+class ArmCheckWiringTests(unittest.TestCase):
+    """Handing a decoder's ``anchor`` to the controller, which is the whole of
+    the leader decoder's gate. If this line is dropped the decoder still
+    computes verdicts and nothing ever asks it for one."""
+
+    def control(self, decoder):
+        controller = Controller(MockArm(), Limits((-3.0,) * 6, (3.0,) * 6), 0)
+        install_arm_check(controller, decoder)
+        return controller
+
+    def test_a_decoder_that_offers_an_anchor_gets_it_installed(self):
+        decoder = Mock(anchor=Mock(return_value=None))
+        controller = self.control(decoder)
+        self.assertIs(controller.pre_arm, decoder.anchor)
+        controller.operator_arm(0)
+        self.assertEqual(controller.state, "ACTIVE")
+        self.assertEqual(len(decoder.anchor.call_args[0][0]), 6)
+
+    def test_its_verdict_reaches_the_state_machine(self):
+        decoder = Mock(anchor=Mock(return_value="the leader is somewhere else"))
+        controller = self.control(decoder)
+        controller.operator_arm(0)
+        self.assertEqual(controller.state, "STOPPED")
+        self.assertEqual(controller.reason,
+                         "refusing to arm: the leader is somewhere else")
+        self.assertFalse(controller.arm.active)
+
+    def test_a_decoder_with_no_anchor_leaves_arming_alone(self):
+        # JsonLineDecoder is the existing wire protocol; nothing about it moves.
+        controller = self.control(JsonLineDecoder())
+        self.assertIsNone(controller.pre_arm)
+        controller.operator_arm(0)
+        self.assertEqual(controller.state, "ACTIVE")
 
 
 class HardwareGateTests(unittest.TestCase):

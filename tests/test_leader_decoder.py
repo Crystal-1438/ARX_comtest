@@ -197,106 +197,136 @@ class StartupTransientTests(unittest.TestCase):
             feed(decoder, b"-1,3281,1060,2353,2875,2085,500")
 
 
-class ReferenceTests(unittest.TestCase):
-    """The unwrap origin is the first frame, so a session that starts away from
-    the calibrated pose is off by that much before it moves at all."""
+class AnchorTests(unittest.TestCase):
+    """Choosing the turn from the arm's pose, at the moment the arm is enabled.
 
-    def decoder(self, reference=VALID_DEG):
+    The map's ``reference_deg`` no longer takes part: what a session started
+    reading says nothing about which turn it is on, and the arm does.
+    """
+
+    def decoder(self, reference=None):
         return LeaderUartDecoder(LeaderMap(joints=(JointMap(),) * 6, calibrated=True,
                                            reference_deg=reference))
 
-    def test_a_session_that_starts_at_the_reference_can_be_armed(self):
-        decoder = self.decoder()
-        feed(decoder, VALID)
-        self.assertIsNone(decoder.startup_blocker)
-        self.assertTrue(decoder.last_telemetry["reference"]["ok"])
+    @staticmethod
+    def arm_at(*degrees):
+        """The measured joint vector whose pose corresponds to these leader angles."""
+        return tuple(math.radians(value) for value in degrees)
 
-    def test_a_session_that_starts_elsewhere_cannot_be_armed(self):
+    def test_the_arm_decides_the_turn_not_the_reference_pose(self):
+        # The core of the change: this session's first frame is nowhere near the
+        # calibrated pose -- 90 degrees out on J3, which the old rule refused --
+        # yet the arm is in exactly that pose, so there is nothing to refuse.
         decoder = self.decoder(reference=[79.5, 328.1, 16.0, 235.3, 287.5, 208.5])
         feed(decoder, VALID)
-        blocker = decoder.startup_blocker
-        self.assertIn("J3", blocker)
-        self.assertIn("+90.0", blocker)
-        self.assertEqual(decoder.last_telemetry["reference"]["worst_joint"], 2)
+        self.assertIsNone(decoder.anchor(self.arm_at(*VALID_DEG)))
+        self.assertTrue(decoder.last_telemetry["anchor"]["ok"])
+
+    def test_a_pose_the_arm_is_in_arms_with_no_bias(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        self.assertIsNone(decoder.anchor(self.arm_at(*VALID_DEG)))
+        self.assertEqual(decoder.mapper.bias, [0.0] * 6)
+
+    def test_the_bias_carries_the_stream_past_the_rollover(self):
+        # J1 reads 4.0 where the arm's pose calls for 354.0: ten degrees apart, but on
+        # opposite sides of the encoder's 0/360 seam. The whole turn of bias is
+        # what makes the rest of the stream continue from there instead of
+        # jumping back to 4.
+        decoder = self.decoder()
+        feed(decoder, b"40,3281,1060,2353,2875,2085,500")
+        self.assertIsNone(decoder.anchor(self.arm_at(354.0, *VALID_DEG[1:])))
+        self.assertEqual(decoder.mapper.bias[0], 360.0)
+        # 5.0 after 4.0 is the next sample, and 365 is where it belongs.
+        self.assertAlmostEqual(feed(decoder, b"50,3281,1060,2353,2875,2085,500")[0].joints[0],
+                               math.radians(365.0))
+
+    def test_a_pose_the_arm_is_not_in_is_refused(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        blocker = decoder.anchor(self.arm_at(169.5, *VALID_DEG[1:]))
+        self.assertIn("J1", blocker)
+        self.assertFalse(decoder.last_telemetry["anchor"]["ok"])
+        self.assertEqual(decoder.mapper.bias, [0.0] * 6)
 
     def test_the_refusal_says_how_far_to_turn_as_well_as_how_far_off(self):
-        # The two numbers answer different questions and are different sizes: a
-        # joint ten degrees from the calibrated pose reads as 350 degrees away,
-        # and 350 is what the arm would be commanded. The literal difference is
-        # why this is refused; the turn is what the operator has to do about it,
-        # and leading with only the first makes a small move look like a large
-        # one -- which is exactly how this message was read the first time.
-        decoder = self.decoder(reference=[354.0, 328.1, 106.0, 235.3, 287.5, 208.5])
+        # Two numbers again, and now the same size: the turn is the physical
+        # move the hand makes and the command is what the arm would be told.
+        # They differ only in sign, so leading with either one alone reads as
+        # the wrong size to half the people reading it.
+        decoder = self.decoder()
         feed(decoder, b"40,3281,1060,2353,2875,2085,500")
-        blocker = decoder.startup_blocker
-        self.assertIn("-350.0", blocker)  # what the arm would be commanded
-        self.assertIn("-10.0", blocker)   # what the operator has to turn
-        self.assertIn("354.0", blocker)   # and what it has to read instead
+        blocker = decoder.anchor(self.arm_at(44.0, *VALID_DEG[1:]))
+        self.assertIn("reads 4.0", blocker)      # where the leader is
+        self.assertIn("arm's pose calls for 44.0", blocker)
+        self.assertIn("turn it +40.0", blocker)  # what the operator has to do
+        self.assertIn("move J1 -40.0 deg", blocker)  # and what arming would do instead
 
     def test_the_refusal_names_every_joint_that_is_out(self):
-        # Naming only the worst would send the operator round the restart loop
-        # once per joint: the verdict is latched, so a joint fixed after the
-        # fact still needs a new process to be noticed.
-        reference = list(VALID_DEG)
-        reference[0] = 30.0
-        reference[2] = 16.0
-        decoder = self.decoder(reference=reference)
+        # Naming only the worst sends the operator round once per joint.
+        decoder = self.decoder()
         feed(decoder, VALID)
-        blocker = decoder.startup_blocker
+        arm = list(VALID_DEG)
+        arm[0] = 169.5   # 90 deg out
+        arm[2] = 6.0     # 100 deg out, so this is the worst
+        blocker = decoder.anchor(self.arm_at(*arm))
         self.assertIn("J1", blocker)
         self.assertIn("J3", blocker)
-        self.assertEqual(decoder.last_telemetry["reference"]["worst_joint"], 2)
+        self.assertEqual(decoder.last_telemetry["anchor"]["worst_joint"], 2)
 
-    def test_arming_before_any_frame_arrives_is_refused(self):
-        # Otherwise the first key press is a race the gate always loses.
-        self.assertIn("no leader frame", self.decoder().startup_blocker)
+    def test_arming_before_any_frame_arrives_is_refused_without_raising(self):
+        # Refused, not crashed: this is called from the controller's arm
+        # transition, so an exception here would come out of the program.
+        decoder = self.decoder()
+        blocker = decoder.anchor(self.arm_at(*VALID_DEG))
+        self.assertIn("no leader frame", blocker)
+        self.assertIsNone(decoder.last_telemetry)
+        self.assertEqual(decoder.mapper.bias, [0.0] * 6)
 
-    def test_the_verdict_is_latched_to_the_first_frame(self):
-        # The origin is already fixed by then; moving the leader back afterwards
-        # cannot make the session correct.
-        decoder = self.decoder(reference=[79.5, 328.1, 16.0, 235.3, 287.5, 208.5])
+    def test_a_session_that_was_never_anchored_reports_null(self):
+        decoder = self.decoder()
         feed(decoder, VALID)
-        self.assertIsNotNone(decoder.startup_blocker)
-        feed(decoder, VALID)
-        self.assertIsNotNone(decoder.startup_blocker)
+        self.assertIsNone(decoder.last_telemetry["anchor"])
 
-    def test_a_warmup_frame_does_not_become_the_origin(self):
-        # The -1 frames are dropped before the mapper sees them, so the origin
-        # has to be the first real frame and the check has to wait for it.
+    def test_a_warmup_frame_is_not_an_origin_to_anchor_against(self):
         decoder = self.decoder()
         self.assertEqual(feed(decoder, b"-1,-1,-1,-1,-1,-1,500"), [])
-        self.assertIsNone(decoder.reference)
-        feed(decoder, VALID)
-        self.assertTrue(decoder.last_telemetry["reference"]["ok"])
+        self.assertIn("no leader frame", decoder.anchor(self.arm_at(*VALID_DEG)))
 
-    def test_a_new_origin_is_judged_again(self):
-        # A board reset restarts the encoders, so the origin -- and therefore
-        # the thing being judged -- is new.
-        decoder = self.decoder(reference=[79.5, 328.1, 16.0, 235.3, 287.5, 208.5])
-        feed(decoder, VALID)
-        self.assertIsNotNone(decoder.startup_blocker)
+    def test_a_board_reset_drops_the_bias_and_needs_another_anchor(self):
+        # The encoders start over, so the origin the bias was chosen against is
+        # gone; carrying it over would apply a whole turn nobody asked for.
+        decoder = self.decoder()
+        feed(decoder, b"40,3281,1060,2353,2875,2085,500")
+        self.assertIsNone(decoder.anchor(self.arm_at(354.0, *VALID_DEG[1:])))
         self.assertEqual(feed(decoder, HANDSHAKE), [])
-        feed(decoder, b"796,3281,1060,2353,2875,2085,500")
-        # 79.6 against a reference of 79.5: only J3 was ever wrong.
-        self.assertIsNotNone(decoder.startup_blocker)
-        self.assertIn("J3", decoder.startup_blocker)
+        self.assertEqual(decoder.mapper.bias, [0.0] * 6)
+        self.assertIsNone(decoder.last_telemetry["anchor"])
 
-    def test_a_reset_rejudges_against_whatever_comes_next(self):
+    def test_a_local_reset_drops_the_bias_too(self):
+        decoder = self.decoder()
+        feed(decoder, b"40,3281,1060,2353,2875,2085,500")
+        decoder.anchor(self.arm_at(354.0, *VALID_DEG[1:]))
+        decoder.reset()
+        self.assertEqual(decoder.mapper.bias, [0.0] * 6)
+        self.assertIn("no leader frame", decoder.anchor(self.arm_at(*VALID_DEG)))
+
+    def test_a_failing_batch_drops_the_bias(self):
         decoder = self.decoder()
         feed(decoder, VALID)
-        decoder.reset()
-        feed(decoder, b"30,3281,1060,2353,2875,2085,500")
-        self.assertIn("J1", decoder.startup_blocker)
+        decoder.anchor(self.arm_at(*VALID_DEG))
+        with self.assertRaises(ProtocolError):
+            feed(decoder, b"795,3281,1060,2353,2875,2085,1001")
+        self.assertEqual(decoder.mapper.bias, [0.0] * 6)
 
-    def test_a_map_without_a_reference_is_reported_not_gated(self):
-        # Maps written before the field existed keep working, exactly as well
-        # as they did before it: the readout has to say they went unchecked.
-        decoder = LeaderUartDecoder(calibrated())
+    def test_the_anchor_survives_a_blank_read(self):
+        # The report rate is below the stream rate, so most printed frames land
+        # on a loop that consumed nothing. The verdict has to still be there.
+        decoder = self.decoder()
         feed(decoder, VALID)
-        self.assertIsNone(decoder.startup_blocker)
-        reference = decoder.last_telemetry["reference"]
-        self.assertFalse(reference["checked"])
-        self.assertIn("reference_deg", reference["why"])
+        decoder.anchor(self.arm_at(*VALID_DEG))
+        decoder.feed(b"")
+        self.assertTrue(decoder.last_telemetry["anchor"]["ok"])
 
 
 class RangeTests(unittest.TestCase):

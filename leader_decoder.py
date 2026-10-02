@@ -9,18 +9,22 @@ joint has never produced a sample". J7 is the gripper ADC. There is no
 checksum and no sequence number, so the only corruption this decoder can catch
 is a value that lands outside its documented range.
 
-A calibrated map also lets this decoder check that a session started at the
-pose the map was measured at, since its unwrapping origin is the first frame.
-``app.py`` refuses to arm until that check passes or proves it cannot run.
+A calibrated map also gives this decoder the ``anchor`` hook: a single-turn
+encoder cannot say which turn it is on, so the pose the arm is actually in picks
+one, and the whole-turn bias that comes out of it is carried until the board
+resets. ``app.py`` installs it as the controller's ``pre_arm`` check, so a
+session where the leader and the arm are not in the same pose is refused instead
+of jumping.
 
 Load it with ``app.py --decoder leader_decoder.py``.
 """
 
+import math
 import re
 import time
 
 from leader_map import (
-    Mapper, check_reference, load_mapping, resolve_mapping_path, shortest_turn,
+    Mapper, load_mapping, resolve_mapping_path, shortest_turn,
 )
 from protocol import Command, ProtocolError
 
@@ -86,65 +90,77 @@ class LeaderUartDecoder:
         self.last_frame = None
         self.last_telemetry = None
         self.mapper = Mapper(mapping)
-        # Verdict on the frame the mapper unwraps from, and whether one is still
-        # owed: every new origin needs its own verdict, so this is re-armed
-        # wherever the origin moves. See startup_blocker.
-        self.reference = None
-        self.reference_pending = True
-        # That frame's angles, kept so the refusal can be phrased in them.
-        self.reference_frame = None
+        # The last anchor verdict, or None if this session has not been anchored
+        # yet. Cleared wherever the unwrap origin moves -- a bias chosen against
+        # the old origin means nothing against the new one.
+        self.anchor_verdict = None
 
     @property
     def calibrated(self):
         return self.mapping.calibrated
 
-    @property
-    def startup_blocker(self):
-        """Why the arm must not be armed yet, or None to allow it.
+    def anchor(self, arm_radians):
+        """Choose the whole turn each encoder is on, from the pose the arm is in.
 
-        The mapper's origin comes from the first frame it sees, so a session
-        that began away from the calibrated pose cannot be corrected from here:
-        the answer is to stop and start again with the leader where it belongs.
+        The controller calls this just before enabling the arm -- it is
+        installed as ``Controller.pre_arm`` -- so this is the moment both
+        readings are on hand. Returns None to arm, or a reason not to.
 
-        Arming before any frame has arrived is refused too -- there is nothing
-        to judge yet, and allowing it would leave the gate open to whoever
-        presses the key first.
+        The one case with no answer is a session with no frame yet: there is
+        nothing to bias, and the turn arithmetic would raise on it. That is
+        refused in words like any other, because an exception here would unwind
+        through the control loop's state transition and out of the program --
+        pressing the key a moment too early must not kill the run.
         """
-        if self.reference is None:
+        needed_deg = [joint.from_arm_deg(math.degrees(angle))
+                      for joint, angle in zip(self.mapping.joints, arm_radians)]
+        if any(angle is None for angle in self.mapper.continuous):
+            self.anchor_verdict = None
             return "no leader frame has arrived yet"
-        if not self.reference.get("checked") or self.reference["ok"]:
+        verdict = self.mapper.anchor(needed_deg)
+        self.anchor_verdict = verdict
+        # Re-publish now rather than waiting for the next frame: the operator
+        # has just asked to arm, and this is the answer. The frame is sticky, so
+        # this repeats the last one with the verdict attached.
+        self._publish(None)
+        if verdict["ok"]:
             return None
-        tolerance = self.reference["tolerance_deg"]
-        # Both numbers per joint, because one is the reason and the other is the
-        # task. A joint tens of degrees from the reference reads as hundreds of
-        # degrees away, and the hundreds are what the arm would be commanded;
-        # leading with those alone makes a small misplacement look like a large
-        # one. See check_reference and shortest_turn.
-        away = [(index, now, reference, offset)
-                for index, (now, reference, offset) in enumerate(zip(
-                    self.reference_frame, self.mapping.reference_deg,
-                    self.reference["offsets_deg"]))
-                if abs(offset) > tolerance]
+        return self._anchor_refusal(verdict, needed_deg)
+
+    def _anchor_refusal(self, verdict, needed_deg):
+        """Say which joints are not where the arm is, and how far to move them.
+
+        Two numbers per joint again, and now they are the same size: the turn is
+        the physical move the hand has to make, and the command is what the arm
+        would be told if it were armed anyway. They differ only in sign. Leading
+        with the turn is what the operator can act on; see shortest_turn.
+        """
+        tolerance = verdict["tolerance_deg"]
         # Every joint that is out, not just the worst: they all have to be
-        # moved, and naming one per restart sends the operator round again.
-        return ("the leader is not in the calibrated pose: " + "; ".join(
-            f"J{index + 1} reads {now:.1f} deg and has to read {reference:.1f} "
-            f"(turn it {shortest_turn(reference, now):+.1f} deg)"
-            for index, now, reference, _ in away) +
-            ". Arming here would command " + " and ".join(
-                f"J{index + 1} {offset:+.1f} deg away from where it belongs"
-                for index, _, _, offset in away) +
-            f" (tolerance {tolerance:.0f} deg). Put the leader in that pose and restart")
+        # moved, and naming one per attempt sends the operator round again.
+        away, moves = [], []
+        for index, joint in enumerate(self.mapping.joints):
+            if abs(verdict["residual_deg"][index]) <= tolerance:
+                continue
+            now = self.mapper.continuous[index]
+            needed = needed_deg[index]
+            away.append(f"J{index + 1} reads {now:.1f} deg where the arm's pose "
+                        f"calls for {needed % 360.0:.1f} "
+                        f"(turn it {shortest_turn(needed, now):+.1f} deg)")
+            moves.append(f"J{index + 1} {joint.sign * verdict['residual_deg'][index]:+.1f} deg")
+        return ("the leader and the arm are not in the same pose: " + "; ".join(away) +
+                ". Arming here would move " + " and ".join(moves) +
+                f" (tolerance {tolerance:.0f} deg). Hand-match the leader to the arm "
+                "and press a again")
 
     def _restart_origin(self):
-        """Re-anchor unwrapping, and ask for a fresh reference verdict.
+        """Re-anchor unwrapping, and drop the verdict that went with it.
 
-        A new origin is exactly the thing that has to be judged again, so this
-        is the one place that moves it.
+        A new origin is exactly the thing the bias was chosen against, so this
+        is the one place that moves it and the only place that has to clear both.
         """
         self.mapper.reset()
-        self.reference_pending = True
-        self.reference_frame = None
+        self.anchor_verdict = None
 
     def reset(self):
         """Drop the half-line and the unwrap history after an upstream reset.
@@ -159,12 +175,6 @@ class LeaderUartDecoder:
         """
         self.buffer.clear()
         self._restart_origin()
-
-    def judge_reference(self, degrees):
-        """Compare the first frame with the calibrated pose, if the map has one."""
-        if self.mapping.reference_deg is None:
-            return {"checked": False, "why": "the map records no reference_deg"}
-        return check_reference(self.mapping.reference_deg, degrees)
 
     def _decode(self, fields):
         """Validate one packet. Returns radians, or None if the frame must be dropped."""
@@ -184,14 +194,7 @@ class LeaderUartDecoder:
             self.no_data += 1
             return None
         self.saw_valid = True
-        degrees = [value / 10.0 for value in fields[:JOINTS]]
-        if self.reference_pending:
-            # This frame is the one the mapper will unwrap from, so this is the
-            # last moment its distance from the calibrated pose can be measured.
-            self.reference_pending = False
-            self.reference_frame = tuple(degrees)
-            self.reference = self.judge_reference(degrees)
-        return self.mapper.to_radians(degrees)
+        return self.mapper.to_radians([value / 10.0 for value in fields[:JOINTS]])
 
     def _publish(self, newest, error=None):
         """Record what the decoder last made of its input.
@@ -219,7 +222,9 @@ class LeaderUartDecoder:
             "dropped": self.dropped,
             "no_data": self.no_data,
             "resets": self.resets,
-            "reference": self.reference,
+            # Held on the decoder rather than in the frame, so it survives the
+            # blank rebuilds on loops that consumed no new bytes.
+            "anchor": self.anchor_verdict,
             "frame": self.last_frame,
         }
         if error is not None:

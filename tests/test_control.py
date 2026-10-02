@@ -101,6 +101,83 @@ class ControlTests(unittest.TestCase):
             VendorArm("/nonexistent", "can0", "2023", "disabled")
 
 
+class PreArmTests(unittest.TestCase):
+    """The veto on enabling the arm, and the one thing it has to be is
+    unavoidable: ARM arrives from the wire as well as from the operator's key,
+    and a check installed on only one of them is a check that can be stepped
+    around. It also has to see the position the arm is started from -- a verdict
+    on a different reading than the one the arm is enabled at would be about
+    nothing."""
+
+    def setUp(self):
+        self.arm = MockArm()
+        self.control = Controller(self.arm, Limits((-1,) * 6, (1,) * 6), 0)
+        self.seen = []
+
+    def blocker(self, reason=None):
+        def check(measured):
+            self.seen.append(measured)
+            return reason
+        self.control.pre_arm = check
+
+    def test_no_hook_leaves_arming_alone(self):
+        # Every decoder that says nothing about itself, which is all of them but
+        # the leader's, has to behave exactly as it did.
+        self.assertIsNone(self.control.pre_arm)
+        self.control.handle(Command("arm", 1, deadman=True), 0)
+        self.assertEqual(self.control.state, "ACTIVE")
+
+    def test_the_wire_path_is_checked_too(self):
+        self.blocker("not in the same pose")
+        self.control.handle(Command("arm", 1, deadman=True), 0)
+        self.assertEqual(self.control.state, "STOPPED")
+        self.assertEqual(self.control.reason, "refusing to arm: not in the same pose")
+        self.assertFalse(self.arm.active)
+
+    def test_the_operator_path_is_checked_too(self):
+        self.blocker("not in the same pose")
+        self.control.operator_arm(0)
+        self.assertEqual(self.control.state, "STOPPED")
+        self.assertIn("refusing to arm", self.control.reason)
+
+    def test_a_refusal_never_touches_the_arm(self):
+        self.blocker("not in the same pose")
+        self.control.operator_arm(0)
+        self.assertEqual(self.arm.writes, [])
+        self.assertFalse(self.arm.active)
+
+    def test_it_sees_the_position_the_arm_would_be_started_from(self):
+        self.arm.positions = (0.3,) * 6
+        self.blocker()
+        self.control.operator_arm(0)
+        self.assertEqual(self.seen, [(0.3,) * 6])
+        self.assertEqual(self.control.state, "ACTIVE")
+        self.assertEqual(self.arm.positions, (0.3,) * 6)
+
+    def test_it_can_be_retried_after_a_refusal(self):
+        # Nothing is latched: the operator moves the leader and presses again.
+        self.blocker("not in the same pose")
+        self.control.operator_arm(0)
+        self.blocker()
+        self.control.operator_arm(1)
+        self.assertEqual(self.control.state, "ACTIVE")
+
+    def test_a_fault_does_not_reach_the_hook(self):
+        # ARM after a fault is already refused by the state machine, and the
+        # hook must not be a way to clear one.
+        self.control.stop("latched", fault=True)
+        self.blocker()
+        self.control.operator_arm(0)
+        self.assertEqual(self.seen, [])
+        self.assertEqual(self.control.state, "FAULT")
+
+    def test_a_repeated_arm_does_not_re_check(self):
+        self.blocker()
+        self.control.operator_arm(0)
+        self.control.operator_arm(1)
+        self.assertEqual(len(self.seen), 1)
+
+
 class OperatorChannelTests(unittest.TestCase):
     """The leader wire format carries no arm/stop, so local keys are the only
     way to enable the arm or to clear a latched fault."""
