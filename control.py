@@ -23,10 +23,27 @@ class Limits:
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError("speed, following error and timeout must be positive")
 
+    def outside(self, joints):
+        """Which joints are past the envelope, each with its value and its bounds.
+
+        A list of strings, empty when everything is inside. Named rather than
+        counted because the fault line is the only place the joint, the value and
+        the configured range can be compared -- and this file is not calibrated
+        against the arm (limits.example.json is a starting point, not a
+        measurement), so the comparison is exactly what the operator has to make.
+        """
+        joints = vector6(joints)
+        return [f"J{index + 1} {q:+.3f} not in [{lo:+.3f}, {hi:+.3f}]"
+                for index, (q, lo, hi)
+                in enumerate(zip(joints, self.lower, self.upper))
+                if not lo <= q <= hi]
+
     def check(self, joints):
         joints = vector6(joints)
-        if any(not lo <= q <= hi for q, lo, hi in zip(joints, self.lower, self.upper)):
-            raise ProtocolError("joint position outside configured limits")
+        outside = self.outside(joints)
+        if outside:
+            raise ProtocolError("joint position outside configured limits: "
+                                + ", ".join(outside))
         return joints
 
 
@@ -130,7 +147,16 @@ class Controller:
         if dt < 0 or dt >= self.limits.timeout:
             self.stop("control loop timing fault", fault=True)
             return feedback
-        self.limits.check(feedback)
+        # A fault, not an exception: this runs outside the loop's decoder guard,
+        # so raising here would leave the state machine by way of main() and take
+        # the process with it -- the arm would stop with no reason on the screen
+        # and no way to press stop. The arm being past the envelope is the same
+        # class of event as the following error below.
+        outside = self.limits.outside(feedback)
+        if outside:
+            self.stop("the arm is outside the configured limits: " + ", ".join(outside),
+                      fault=True)
+            return feedback
         if any(abs(q - actual) > self.limits.max_following_error
                for q, actual in zip(self.commanded, feedback)):
             self.stop("joint following error", fault=True)

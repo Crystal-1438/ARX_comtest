@@ -83,6 +83,29 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.control.handle(Command("target", 3, (math.inf,) * 6, True), 0.1)
 
+    def test_an_out_of_range_target_names_the_joint_and_both_numbers(self):
+        # "joint position outside configured limits" is the whole message
+        # otherwise, and with six joints in the arm that leaves the operator to
+        # guess which one -- on a live run, the only place the joint, the value
+        # and the configured range can be compared is this line.
+        self.arm_controller()
+        with self.assertRaises(ProtocolError) as caught:
+            self.control.handle(
+                Command("target", 2, (0.0, 1.5, 0.0, 0.0, 0.0, 0.0), True), 0.01)
+        self.assertIn("J2 +1.500 not in [-1.000, +1.000]", str(caught.exception))
+
+    def test_the_arm_s_own_feedback_outside_the_envelope_faults_and_does_not_raise(self):
+        # This check runs outside the loop's decoder guard, so raising would
+        # leave the state machine by way of main() and take the process with it:
+        # the arm would stop with an ERROR line instead of a state the operator
+        # can read and clear.
+        self.arm_controller()
+        self.arm.positions = (0.0, 0.0, 0.0, 0.0, 0.0, 2.0)
+        self.control.tick(0.01)
+        self.assertEqual(self.control.state, "FAULT")
+        self.assertIn("J6 +2.000 not in [-1.000, +1.000]", self.control.reason)
+        self.assertFalse(self.arm.active)
+
     def test_following_error_stops(self):
         self.arm_controller()
         self.arm.positions = (0.5,) * 6
