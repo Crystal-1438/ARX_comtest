@@ -151,6 +151,22 @@ G_COMPENSATION, END_CONTROL, POSITION_CONTROL }`（顺序即取值），`Control
 **CAN 套接字一关，本进程就不会再发出任何指令**；`DisableMotor` 这个标签属于厂商的关停路径，
 但"驱动器是否真的因此失去力矩"没有实测，不能当已验证结论。见 §12.13。
 
+**关节增益（PID）改不了 —— 这是查证过的结论，不要再去翻。** 三条独立证据：
+
+1. 公开 Python 接口没有增益入口（全部 pybind 导出只有位置/位姿/夹爪/模式/读取/`arx_x`）。
+2. 底层帧里**确实**带 `k_p`/`k_d`（`HybridJointCmd`，DWARF 确认 40 字节，偏移 0/8/16/24/32），
+   但值是 SDK 内部按关节填的：`ControllerBase::statePositionControl()` 从控制器成员取
+   `k_p`/`k_d`，不是调用参数，外面没有传进去的路。
+3. **没有源码，也不读配置**：厂商只给了两个 `.cpp`（pybind 壳 `single_arm_interface.cpp` 与
+   `kinematic_solver.cpp`），`bimanual/CMakeLists.txt:22` 对控制器只有
+   `target_link_libraries(... libarx_x5_src.so)`；这份 `.so` 的 strings 里没有任何
+   `.json/.yaml/.ini/.cfg`，符号表里没有 `ifstream`/`fopen`/`loadConfig`。
+
+所以"改源码重编"和"改参数文件"两条路都不存在，只剩给 `.so` 打二进制补丁或运行时改内存——
+两者都要求动固定的快照（见本节开头），不建议。**唯一外部可见的厂商数值是
+`arx_x(500, 2000, 10)`，它进的是 `arx::solve::Interpolation`（厂商自己的轨迹插值），不是增益。**
+反汇编细节、已定位到的常量、以及为什么认不出哪一组是 kp/kd，见 §12.24。
+
 ## 6. 串口契约与状态机
 
 当前协议仅用于测试，不是用户最终控制器协议。UTF-8 JSON 行、默认 115200 / 8N1：
@@ -447,6 +463,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | `--watch` 单人可读输出（离线） | `watch_line` 直接单测：六个关节的转角与 `+6.1f` 对齐、`out of pose` 点名列出的关节与容差、全部在容差内时写 `in the arm's pose, press a`、没帧时写 `waiting for the leader's first frame` 且**不打 J1**（打 0 会被读成"已经在姿态里"，是唯一错误答案）、ACTIVE/FAULT 只报状态与理由（ACTIVE 且有关节被限幅时尾部补 `at the limit: J3 J5`，测试里的假 controller 必须显式给 `saturated`——`Mock` 自动生成的属性为真且不可迭代）、没有 `distance()` 的解码器也能出一条行；PTY 里 `--watch` 真的打出**行**而不是 JSON（含 `J1`/`J6`、不含 `{`）、`a` 之前写 waiting、按 `a` 后下一行是 `ACTIVE ... armed at measured position`（成功 arm 会变 `state`，这条认不出节流退化；认得出的是 `PrintThrottleTests` 里"`state` 不变而 `reason` 变"那条）。见第 12.20 节 |
 | 越界限幅与点名（离线） | 目标越界**不限幅为异常、也不停机**：六个分量各自夹到边界、被夹的关节记进 `saturated`、控制保持 ACTIVE，再发一帧范围内的 target 即恢复（同一个序列继续）；被夹在边界上时机械臂滞后 0.05 rad（在 `max_following_error` 内）走完整拍而不 FAULT——**把 `tick()` 里那条绝对越界检查加回去，这条即以 FAULT 失败**；`stop()` 清空 `saturated`。**机械臂实测**越界仍然拒绝 arm，`Limits.outside()` 逐关节给 `J6 +2.000 not in [-1.000, +1.000]`，走 `refusing to arm: ...` 而**不是抛异常**（按键路在解码器 guard 之外，抛出去会退出 2）；机械臂离指令 2.0 rad 时由 `joint following error` 兜住，是 FAULT 而非异常（`tick` 在 guard 之外，抛出去会穿到 `main()` 退出 2、屏上只剩 ERROR）。见第 12.22 节 |
 | 指令轨迹：跟踪微分器（离线） | `td.py` 是 `ref/adrc.c` 的 `fst`/`TDFunction_independent` 逐项转写，用性质而非重算钉住：远场加速度恒等于 `r`、误差为零且静止时输出为 0、任意误差/速度下 `\|fst\| <= r`、静止时加速度方向与误差相反；六组 r × 五档 dt × 六种步长的**步响应从不越过目标**（这正是"指令不会自己出界"的依据）、最终停在目标上（1e-9）、速度被 `max_speed` 夹住、同一时刻 r 大的关节走得更远；**多圈**：350→370 单调穿过 360（不折回时把误差按 ±180 折一下即失败），700→730 照常收敛；`dt<=0` 原地不动、长度不符抛 `ValueError`。`control.py` 侧：arm 后第一拍就停在实测位置（步长 0 的跳变）、同一目标下一拍位移大于上一拍（还在加速）、全程不越过目标、`td_r_deg` 与 `max_speed` 分别可配置地起作用、多圈 target 穿过 360° 不回摆（`Limits((-10,)*6,(10,)*6)`）、`td_r_deg` 非法（长度、0、负数、字符串）在构造时报 `ValueError`。见第 12.23 节 |
+| 关节增益不可调（离线反汇编） | 三条独立证据：pybind 只导出位置/位姿/夹爪/模式/读取；`k_p`/`k_d` 在整份 DWARF 里**只**作为 `HybridJointCmd` 的字段名存在（控制器成员没有同义名字），且 `statePositionControl()` 里它们来自控制器成员、不是调用参数；`.so` 不引用任何配置文件名、无 `ifstream`/`fopen`，所以增益是二进制内常量。仓库里也没有控制器源码（`CMakeLists.txt:22` 只 `target_link_libraries` 预编译 `.so`）。见第 12.24 节 |
 | `fit` 的锚点（离线） | 夹具把 session 的 `continuous_deg` 整体挪一圈（`raw` 不变）后，写出的 map 仍能被新 `Mapper` 从 `raw` 复现出记录的臂角；**把这一行改回 `continuous_deg` 该测试即以 360.0 的差值失败**（三条测试同时失败），见第 12.16 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
@@ -1386,3 +1403,63 @@ target 真的算到了界外（限位没校准、映射错）。停机意味着 
 且依赖该工程自己的 `common.h`），**不提交**，只作为本次转写的出处；`td.py` 是转写而非引用。§12.22 里"限速在两个界内点之间插值（逐关节凸性）"这句话在新实现下由"轨迹不越过目标"
 承接（性质由 `test_a_step_is_approached_without_passing_it` 钉住），结论不变，措辞已过时。
 `limits.json` 的 `lower`/`upper` 仍未标定，与本次改动无关。
+
+### 12.24 SDK 里的关节增益改不了（2026-10-03，只反汇编，未动任何文件）
+
+**问题（操作者，依次三问）：** "arx 的 sdk 支持控制速度吗" → "我可以调整电机的参数吗" →
+"准确地说是 pid 的参数" → "能不能修改 sdk 中的 pid 参数"。答案为**否**，且是查证过的否。
+本节把证据留在这里，省掉下一次反汇编。全程只读：`.so`、头文件、DWARF 都没改。
+
+**速度控制：没有。** 三条证据：`InterfacesPy.hpp:20` 的 `set_joint_velocities()` 声明处自己写着
+`// useless` 且无参数；它没进 pybind（`single_arm_interface.cpp` 的完整导出列表里没有）；
+`nm -DC` 的符号表里根本没有这个符号。头文件里"声明了但没实现"的方法不止这一个（例如
+`gravity_compensation()`，见 §5），**所以头文件不是规格，只能当线索**。
+
+**增益（PID）：接口没有，源码没有，配置也没有。**
+
+- 接口层：全部 pybind 导出是 `set_joint_positions` / `set_ee_pose` / `set_arm_status` /
+  `set_catch` / `get_joint_*` / `get_catch_status` / `arx_x`。没有任何接受 kp/kd/增益的函数。
+- 数据层：底层 CAN 命令帧**确实**带 `k_p`/`k_d`（MIT 式），`HybridJointCmd{position, velocity,
+  torque, k_p, k_d}` 由 DWARF 确认（`byte_size` 40，`decl_file` = `HybridJointTypeDef.hpp`，
+  偏移 0/8/16/24/32）。但 `ControllerBase::statePositionControl()`（0x132c0）填帧时
+  `k_p ← 0x4f8(%rbp)` 解引用、`k_d ← 0x510(%rbp)`、`torque ← 0x4b8(%rbp)`——都是控制器成员，
+  不是调用参数，没有外部注入路径。
+- 名字层：整份 DWARF（1.3 MB，`readelf --debug-dump=info`）里 `k_p`/`k_d` **只**出现在
+  `HybridJointCmd`。没有任何 gain/PID 结构体、配置项或同义成员名。
+- 源码层：仓库里厂商只给了 `bimanual/src/single_arm_interface.cpp`（pybind 壳）与
+  `kinematic_solver.cpp`。`bimanual/CMakeLists.txt:22` 对控制器是
+  `target_link_libraries(${PROJECT_NAME} PUBLIC .../lib/arx_x5_src/libarx_x5_src.so ...)`——
+  `ControllerBase`/`MotorType2`/`MotorType4`/`SocketCan` 全部只有预编译 `.so`，**没有源码可改**。
+- 配置层：该 `.so` 的 strings 里搜不到任何 `.json/.yaml/.ini/.cfg`，符号表里也没有
+  `ifstream`/`fopen`/`loadConfig`/yaml 之类。**它不读配置文件**，所以"改参数文件"也不成立。
+
+**已定位到的常量（供参考，但认不出哪一组是增益）。** `ControllerBase::ControllerBase`
+（0x158d0）用 `movdqa` 把 rodata 常量拷进对象，在 `.rodata` 里解出来是：
+
+| 地址 | 值 | 形状 |
+| --- | --- | --- |
+| 0x32160 | 0.53, 0.53, 0.53, 1.74533, 1.48353, 1.48353 | 6 个（≈30°,30°,30°,100°,85°,85°） |
+| 0x321a0 | 上面对应的负值 | 6 个，负向 |
+| 0x321e0–0x32210 | **13.0 × 7** | 7 个（6 关节 + 夹爪？） |
+
+`Init()` / `statePositionControl()` 还读到一批标量：0.08、0.1、0.2、0.5、1、2、8、13、200、
+1000、5000、1.74533、-2.618（地址 0x325a0–0x32830）。**那 7 个 13.0 是 kp 的候选，但同样
+可能是电流/力矩上限**——没有符号名，从外部无法证明。猜错一个常量就是在实机上改一段没人
+验证过的硬件行为，所以本节到此为止，不给"大概是哪个"的结论。
+
+**剩下两条技术路线，都不建议：** ①给 `.so` 打二进制补丁（改常量字节）——违反 §5 开头
+"快照不变"的约定，改完版本不可追溯，重装/升级即失效，无法回滚；②运行时内存改写
+（ctypes 定位控制器对象改数组）——不改文件但更脆，每次启动重做，且依赖偏移认对。
+
+**正路**：向 ARX 索取带增益接口的 SDK/固件，或用厂商自己的上位机改驱动器侧参数——那个工具
+不在这份快照里，**本仓库无法评价它能改什么**，不能替它下结论。
+
+**唯一外部可见的厂商数值是 `arx_x(a, b, c)`。** 厂商自己的 `bimanual/script/single_arm.py:95`
+在 `__init__` 里调 `arx_x(500, 2000, 10)`；`InterfacesPy::arx_x`（0x19dd0）把三个 double 存进
+对象 0x178/0x180 等偏移，而 `statePositionControl()` 又把 `0x178(%rbp)`/`0x180(%rbp)` 读出来
+交给 `arx::solve::Interpolation(double*, double*, double*, double, double, double)`（0x29a30）。
+即：**这三个数调的是厂商自己那层轨迹插值，不是 kp/kd。** 想要"更跟手"能调的是这里，
+加上我们自己的 `td_r_deg` / `max_speed`（§12.23），而不是驱动器增益。
+
+**安全（照 §5 的边界说）：** 这套系统没有外部急停。任何改驱动器参数的动作都是硬件行为变更，
+必须在机械臂已被支撑、且手能立刻断电的前提下做；SOFT 是零力矩，不是失能。
