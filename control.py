@@ -50,6 +50,23 @@ class Controller:
         self.target = self.commanded = None
         self.arm.stop()
 
+    def _apply(self, kind, joints, now):
+        """State transitions shared by the wire path and the local operator path."""
+        if self.state == "FAULT":
+            return  # Explicit STOP followed by ARM is required after a fault.
+        if kind == "arm":
+            if self.state != "STOPPED":
+                return  # Repeated ARM frames cannot refresh the target watchdog.
+            self.commanded = self.limits.check(self.arm.read_joints())
+            self.target = self.commanded
+            self.arm.start(self.commanded)
+            self.state = "ACTIVE"
+            self.reason = "armed at measured position"
+            self.last_input = self.last_tick = now
+        elif self.state == "ACTIVE":
+            self.target = self.limits.check(joints)
+            self.last_input = now
+
     def handle(self, command, now):
         if not isinstance(command, Command):
             raise ProtocolError("decoder must return Command objects")
@@ -65,20 +82,22 @@ class Controller:
         if not command.deadman:
             self.stop("deadman released")
             return
-        if self.state == "FAULT":
-            return  # Explicit STOP followed by ARM is required after a fault.
-        if command.kind == "arm":
-            if self.state != "STOPPED":
-                return  # Repeated ARM frames cannot refresh the target watchdog.
-            self.commanded = self.limits.check(self.arm.read_joints())
-            self.target = self.commanded
-            self.arm.start(self.commanded)
-            self.state = "ACTIVE"
-            self.reason = "armed at measured position"
-            self.last_input = self.last_tick = now
-        elif self.state == "ACTIVE":
-            self.target = self.limits.check(command.joints)
-            self.last_input = now
+        self._apply(command.kind, command.joints, now)
+
+    def operator_stop(self, reason="operator stop"):
+        """Local STOP. Clears a latched FAULT, and never touches the wire sequence."""
+        self.stop(reason)
+
+    def operator_arm(self, now):
+        """Local ARM, exempt from the wire sequence.
+
+        A decoder for a wire format that carries no arm/stop -- the leader
+        board's, for instance -- can never enable the arm and can never clear a
+        latched fault on its own. This is that missing channel. It leaves
+        last_seq alone, so an operator action can neither collide with nor
+        consume a decoder's own numbering.
+        """
+        self._apply("arm", (), now)
 
     def watchdog(self, now):
         # Call before processing newly arrived input so late packets cannot revive motion.

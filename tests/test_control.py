@@ -101,5 +101,52 @@ class ControlTests(unittest.TestCase):
             VendorArm("/nonexistent", "can0", "2023", "disabled")
 
 
+class OperatorChannelTests(unittest.TestCase):
+    """The leader wire format carries no arm/stop, so local keys are the only
+    way to enable the arm or to clear a latched fault."""
+
+    def setUp(self):
+        self.arm = MockArm()
+        self.control = Controller(self.arm, Limits((-1,) * 6, (1,) * 6), 0)
+
+    def test_local_arm_captures_the_measured_pose(self):
+        self.arm.positions = (0.3,) * 6
+        self.control.operator_arm(0.1)
+        self.assertEqual((self.control.state, self.control.target), ("ACTIVE", (0.3,) * 6))
+        self.assertTrue(self.arm.active)
+
+    def test_local_commands_are_exempt_from_the_wire_sequence(self):
+        self.control.operator_arm(0.1)
+        self.control.operator_stop()
+        self.control.operator_arm(0.2)
+        self.assertEqual(self.control.state, "ACTIVE")
+        # An operator action must not consume or renumber wire sequences.
+        self.assertEqual(self.control.last_seq, -1)
+        self.control.handle(Command("target", 0, (0.5,) * 6, True), 0.3)
+        self.assertEqual(self.control.last_seq, 0)
+
+    def test_local_stop_clears_a_latched_fault(self):
+        self.control.operator_arm(0.1)
+        self.control.watchdog(1.0)
+        self.assertEqual(self.control.state, "FAULT")
+        self.control.operator_arm(1.1)
+        self.assertEqual(self.control.state, "FAULT")  # still needs an explicit stop
+        self.control.operator_stop()
+        self.assertEqual(self.control.state, "STOPPED")
+        self.control.operator_arm(1.2)
+        self.assertEqual(self.control.state, "ACTIVE")
+
+    def test_local_arm_does_nothing_when_already_active(self):
+        self.control.operator_arm(0.1)
+        self.arm.positions = (0.5,) * 6
+        self.control.operator_arm(0.2)
+        # Re-anchoring mid-motion would silently discard the slew limit.
+        self.assertEqual(self.control.target, (0.0,) * 6)
+
+    def test_local_stop_reports_why(self):
+        self.control.operator_stop("panel button")
+        self.assertEqual((self.control.state, self.control.reason), ("STOPPED", "panel button"))
+
+
 if __name__ == "__main__":
     unittest.main()
