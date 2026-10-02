@@ -13,7 +13,11 @@ ARX_comtest/
 ├── backends.py            # SDK 与模拟机械臂
 ├── control.py             # 状态机、限速及超时处理
 ├── protocol.py            # 可替换的串口帧解析器
+├── leader_decoder.py      # 外接遥操作器 USART3 文本流解码器
+├── leader_map.py          # 单圈角度到关节弧度的标定映射
+├── operator_keys.py       # 本地按键 arm/stop 通道
 ├── limits.example.json    # 关节限制示例
+├── leader_map.example.json # 遥操作器标定示例
 ├── requirements.txt       # pyserial
 ├── requirements-sdk.txt   # SDK 编译/包装需要的 numpy、pybind11
 ├── scripts/               # 依赖安装、SDK 编译、环境设置和启动
@@ -22,7 +26,8 @@ ARX_comtest/
 ```
 
 单臂程序，不启动 ROS、ZMQ 或原项目的硬件服务器。USB2CAN 对应 SocketCAN
-接口（例如 `can0`）；外接遥操作器使用另一个串口（例如 `/dev/ttyUSB1`）。
+接口（例如 `can0`）；外接遥操作器使用另一个串口，且必须用 `/dev/serial/by-id/`
+路径指定（见下方「外接遥操作器」一节的 by-id 警告）。
 两者不能使用同一设备节点，也不要和其他机械臂控制进程同时占用同一 CAN 总线。
 
 停止采用 **SOFT 零力矩模式**：`set_arm_status(0)`，并持续读取、
@@ -194,6 +199,84 @@ SDK 不提供公开的反馈时间戳、线程关闭、通信 watchdog 或失能
 因此本程序的超时保护只在 Python 循环正常运行时有效，无法保证进程被强杀、
 SDK 卡住、CAN 拔线之后的电机行为。实机阶段应先验证外部急停与断流行为。
 
+## 外接遥操作器（Leader_f103c8t6）
+
+`docs/uart_packet.md` 是这块板的完整线格式规格。要点：USART3、115200 8N1、
+ASCII 行 `<J1>,<J2>,<J3>,<J4>,<J5>,<J6>,<J7>\r\n`，约 200 Hz；
+前六维是 **0.1° 单圈绝对角**（`0..3599`），第七维是夹爪 ADC（`0..1000`）。
+**没有 CRC，也没有序号**——一个被翻转的字节会变成一个看起来合法的数值，
+所以解码器唯一能抓到的损坏就是落到了文档区间之外的值（那会按故障处理）。
+包之间也判不出丢包，只能靠统计收包数反推。
+
+### 端口必须用 by-id
+
+CH340（这块板）和 CANable2（USB2CAN）**都是 `/dev/ttyACM*`**，编号会随插拔顺序变。
+`docs/uart_packet.md` 里「`/dev/ttyACM0` 不是这块板的串口」这句话在 Robot PC 上不成立
+（实测该 by-id 正指向 `ttyACM0`）。始终用 by-id 路径，不要用 `ttyACM` 编号，
+否则可能误占 `slcand` 正在用的 CAN 适配器端口。
+
+```bash
+ls -l /dev/serial/by-id/      # 确认哪一个是 1a86 CH340、哪一个是 CANable2
+```
+
+### 先只解析，不驱动机械臂
+
+不加 `--operator-keys` 就永远不会 arm，属于纯解析；用输出的 `leader` 块看结果。
+这一步只读串口、用模拟机械臂，不开 CAN、不加载厂商库：
+
+```bash
+bash scripts/run.sh --mode teleop --backend mock \
+  --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00 \
+  --decoder "$PWD/leader_decoder.py" --print-rate 5 --duration 10
+```
+
+`leader` 块里的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `frames` / `dropped` / `no_data` / `resets` | 累计收到、丢弃、`-1`、板子复位次数 |
+| `frame.angle_deg` / `gripper` / `fields` | 最近一帧的解读 |
+| `frame.target_rad` | 经映射后真正要发给机械臂的六维目标 |
+| `frame.host_monotonic` | 该帧的解析时刻；**它不动就说明流停了**（值会保留，不会变空） |
+| `map_source` / `calibrated` | 实际加载的标定文件；`<uncalibrated default>` 表示没有标定 |
+| `error` | 本批被判为故障的原因 |
+
+`frames` 与 `seq` 不是一回事：`seq` 每个控制周期最多加一，跟的是控制循环；
+`frames` 数的是真正收到的包，判 200 Hz 和丢包要看它。
+
+### 按键控制
+
+这块板只报位置，不报 arm/stop，所以必须由本地按键显式使能：
+
+```bash
+bash scripts/run.sh --mode teleop --backend mock \
+  --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00 \
+  --decoder "$PWD/leader_decoder.py" --operator-keys --limits /path/to/limits.json
+```
+
+`a` 使能（以当前测量位置为起点），`s` 或空格停止，`q`/Ctrl+C 退出。
+按键先于同批串口帧处理，所以本地停止不会被同一批的目标盖过。
+FAULT 后必须先按 `s` 再按 `a`，与线协议恢复语义一致。
+
+### 标定：接实机之前必须做
+
+leader 报的是**单圈绝对角**，没有自己的零点。要变成关节弧度，需要每个关节的
+方向（`sign`）、零位（`offset_deg`）和是否多圈（`unwrap`）——**规格里没有，必须实测标定**。
+
+```bash
+cp leader_map.example.json leader_map.json   # 该文件已被 .gitignore 忽略
+```
+
+公式是 `sdk_deg = sign * continuous_deg + offset_deg`（再转 rad）。
+**未标定的映射不会失败得很安全**：符号或零位错了，指向的是一个关节限位完全接受的
+真实位置。因此程序在 `--backend sdk` 的 teleop 下会**拒绝启动**，直到配置文件里
+写了 `"calibrated": true`；解码器发不出 `arm`/`stop` 而 `--operator-keys` 又没开时同样拒绝。
+`JsonLineDecoder` 不声明这两个属性，因此原有硬件路径不受影响。
+
+已知缺口，接实机前必须处理：文档 §2 说编码器采到过数据后又断开会**冻结在最后一个有效值**，
+`-1` 判据抓不到这种坏法；值域内的静默错误（`2117 → 2717`）也抓不到。
+两者都需要额外的存活性/跳变判定。
+
 ## 临时帧格式与后续替换
 
 当前只为开发验证提供 UTF-8 JSON，每帧以换行结束，115200 8N1 是默认测试值。
@@ -233,8 +316,14 @@ def create_decoder():
 ## 本次验证边界（2026-10-02）
 
 已验证 Python 控制逻辑、SDK 调用顺序（替身）、伪终端串口接收和模拟运行。
-31 项测试通过，包括独立目录、安装预览、缺包报错和启动脚本检查。
+105 项测试通过，包括独立目录、安装预览、缺包报错和启动脚本检查，
+以及遥操作器解码（拆行、握手、`-1`、越界、映射与展开）、本地按键通道和
+「leader 字节→解码→映射→状态机」的伪终端端到端链路（全程 mock，不碰 CAN）。
 模拟依赖安装已在新的 `.venv` 中实际运行成功；两个 SDK 绑定已用 Python 3.14 / pybind11 3
 编译并安装到验证目录，但本机缺少 KDL 运行库，完整 SDK 安装正确报错且未产生 READY 标记。
-本机没有 CAN / USB 串口设备，尚未完成 SDK 导入成功验证、实机读角度或运动测试。
-请先在 Robot PC 完成 SDK 安装、preflight 和停止状态读角度，再进行低速串口控制测试。
+工作机上没有 CAN / USB 串口设备，未完成 SDK 导入成功验证、实机读角度或运动测试。
+这些已在另一台 Robot PC（Ubuntu 22.04，接 USB2CAN 与机械臂）完成，见
+[HANDOFF.md](HANDOFF.md) 第 12 节；**两节的结论不可互相覆盖**，尤其「SDK 能否加载」
+在两台机器上答案不同。遥操作器解码器已在 Robot PC 上对着真实串流跑通（约 211 Hz，
+零错误），但仍然只在模拟机械臂上验证，未驱动过真机。
+请先完成标定（见上），再进行低速串口控制测试。

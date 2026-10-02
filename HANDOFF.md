@@ -66,9 +66,13 @@ bash scripts/install_dependencies.sh --sdk --dry-run
 | --- | --- |
 | `app.py` | CLI、100 Hz 主循环、非阻塞串口、状态输出、Ctrl+C/SIGTERM 清理 |
 | `protocol.py` | 临时 JSON 行协议；`Command`、`ProtocolError` 与 `feed(bytes)` 契约 |
+| `leader_decoder.py` | 外接遥操作器 USART3 文本流解码器；见第 6 节末的契约 |
+| `leader_map.py` | 单圈角度 → 关节弧度的标定映射；路径解析的唯一权威 |
+| `operator_keys.py` | 本地按键 arm/stop 通道（必须叫这个名字，见文件内注释） |
 | `control.py` | STOPPED / ACTIVE / FAULT 状态机、范围检查、限速、超时、跟随误差 |
 | `backends.py` | `MockArm` 与 `VendorArm`；真实 SDK 状态映射、构造/模式切换 |
 | `limits.example.json` | 六个关节的示例边界及限速参数；不是已核验实机配置 |
+| `leader_map.example.json` | 遥操作器标定文件模板；用户复制为被忽略的 `leader_map.json` |
 | `scripts/install_dependencies.sh` | apt 包候选检查、venv/Python 依赖、调用 SDK 编译 |
 | `scripts/build_sdk.sh` | 架构/头文件/ldd 检查、构建、安装、只导入验证、READY 标记 |
 | `scripts/native/CMakeLists.txt` | 编译厂商两个绑定；相对 RPATH；安装到独立 `.sdk` |
@@ -147,6 +151,44 @@ sha256sum -c SHA256SUMS
 最终协议还缺：帧头、长度、字节序、校验、关节顺序/方向/单位/零位、发送频率、
 deadman/arm/stop 来源、序号/时间戳/重启握手，以及是否增加夹爪。不要自行猜测。
 
+### 6.1 外接遥操作器解码器（`leader_decoder.py`）
+
+`docs/uart_packet.md` 描述的是**另一条串口链路**（leader 板 USART3），不是上面第 6 节的
+控制器协议，两者不要混淆。它通过 `--decoder leader_decoder.py` 接入，不需要改动
+`protocol.py`。线上格式：115200 8N1、约 200 Hz、ASCII 行
+`<J1>..<J6>,<J7>\r\n`，前六维为 **0.1° 单圈绝对角**（`0..3599`，哨兵 `-1` = 从未采样），
+J7 为夹爪 ADC（`0..1000`）。
+
+已实现并已被测试固定的语义：
+
+- 逐字段用 `^-?[0-9]+$` 严格匹配，字段数必须恰好 7；不符合的行**静默丢弃并计入
+  `dropped`**（落单的半行不会污染下一帧）。**不用 `int()`**：它会接受 `b" 12"`、`b"+12"`，
+  正是字节翻转产生形状。
+- 值域越界（J1..J6 非 `-1` 且不在 `0..3599`、J7 不在 `0..1000`）→ `ProtocolError`。
+  **线上没有 CRC、没有序号**，越界是唯一能被发现的损坏。
+- `-1` 判据带**预热豁免**：在看到第一帧六维全有效帧之前，含 `-1` 的帧整帧丢弃、只记
+  `no_data`；一旦见过有效帧，任一维 `-1` 立即 FAULT。否则每次 leader 板上电都会锁存 FAULT
+  （文档 §4 说复位后头几个包就是 `-1`）。
+- 板子复位由握手行 `0123456789` 宣告，只计数（`resets`）并重新进入预热，不算损坏。
+- **一批里所有完整行都要过校验**，任一坏行就抛错、不返回任何 Command——坏帧不能躲在
+  好帧后面。全部干净时只返回**最新一帧**（200 Hz 输入 vs 100 Hz 循环，陈旧目标无意义）。
+- 解码器自造严格递增 `seq`，`deadman=True`；`seq` 数的是交给控制器的**批次数**，
+  `frames` 数的是真正收到的**包数**，判丢包只能看后者。
+- `last_frame` 是**粘性**的，带 `host_monotonic`：打印频率低于流频率，约一半的记录落在
+  没有新字节的循环上，空白帧会让健康流看起来是断的；**时间戳不动才是流停了**。
+- 声明 `provides_arm = False`：这块板只报位置，不报 arm/stop。
+
+**序号冲突的解法**（不要改回去）：decoder 的 `seq` 与 `controller.last_seq` 是两个独立
+空间。`control.py` 早就让 `stop` 豁免序号单调检查，现在把 `arm` 也纳入这条「操作员通道」
+（`operator_arm()` / `operator_stop()`），二者都不碰 `last_seq`。这样 `protocol.py` 零改动，
+`JsonLineDecoder` 也能直接配本地按键。**不要**引入 decoder 必须提供的共享 `SeqCounter`
+隐式契约。
+
+**门禁**：leader 映射未标定时 `--backend sdk --mode teleop` **拒绝启动**，解码器发不出
+`arm`/`stop` 而 `--operator-keys` 又没开时同样拒绝。理由见第 9 节缺口 1。两个检查都是
+decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` 不声明这两个属性，
+原有硬件路径不受影响。
+
 ## 7. 安装与运行环境
 
 应用 Python 3.10+；SDK 原装扩展是 Linux x86_64 / CPython 3.12。
@@ -179,7 +221,10 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 31 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 105 项通过，含真实 pyserial + PTY |
+| leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
+| leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
+| 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -196,6 +241,10 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 这不意味着通过了 build_sdk.sh 的运行库检查，更不意味着 SDK 已可用。
 当前 `.venv` 额外安装了用于编译验证的 cmake / numpy / pybind11；正式脚本的 CMake 来自 apt。
 
+leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 12.8 节：211 Hz、零错误），
+但**只在模拟机械臂上验证过，从未驱动真机**。上表「实机读角度、串口控制器、运动：
+未测试」的结论对本节工作机仍然成立。
+
 ## 9. 下一位 agent 的具体工作顺序
 
 1. 阅读本文和 README，检查 Git 状态，跑模拟测试建立基线。不要重复克隆旧父工程。
@@ -205,10 +254,30 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
    preflight 只检查导入/设备，不证明电机在线或反馈新鲜。
 4. 支撑机械臂，先用 monitor 验证 SOFT 与六关节读数方向/单位，再校准限位。
    保留外部急停，验证停止/断流的实际行为；不要自动回零或发送示例绝对位置。
-5. 拿到正式协议后实现独立 decoder，补捕获字节流的离线测试和 PTY 集成测试；
-   明确编码器到 SDK 角度的转换。随后再接入低速实机控制。
-6. 如要求真正失能，需厂商提供关闭/失能及失能后读反馈的正式 API/协议，当前不能承诺。
-7. 每个小改动验证后提交推送，更新本文的验证边界和未完成事项。
+5. leader 解码器已接入（第 6.1 节）。**下一步是标定，不是调参**：
+   先只解析（不加 `--operator-keys`，见 README「外接遥操作器」一节），逐个关节实测
+   `sign` / `offset_deg`，写进被忽略的 `leader_map.json` 并置 `"calibrated": true`；
+   门禁会一直挡着实机 teleop，直到这一步完成。
+6. 标定之后再处理第 9.1 节列出的两个解码器缺口（冻结值、值域内静默错误），
+   然后才做低速实机控制，并从 mock 换成 `--backend sdk`。
+7. 如要求真正失能，需厂商提供关闭/失能及失能后读反馈的正式 API/协议，当前不能承诺。
+8. 每个小改动验证后提交推送，更新本文的验证边界和未完成事项。
+
+### 9.1 解码器已知缺口（接实机前必须处理）
+
+1. **零位不可知。** leader 报的是单圈绝对角，没有自己的零点。`sign` / `offset_deg`
+   错了**不会失败得很安全**：它指向的是一个关节限位完全接受的真实位置。不标定就 arm，
+   第一批 target 很可能直接撞 `Limits.check`（`control.py:26`）而 FAULT。这是设计缺口。
+2. **冻结值抓不到。** 文档 §2 说编码器采到过数据后又断开会**冻结在最后一个有效值**，
+   `-1` 判据完全抓不到这种坏法，而冻结值看起来是一个完美的稳定读数。
+   需要「N ms 未变化」的存活性判定。本轮只计数/打印。
+3. **值域内的静默错误抓不到。** `2117 → 2717` 这种翻转仍落在 `0..3599` 内，
+   越界检查看不见。限速只限制单拍步长，长期仍会跟过去。需要可选的最大跳变过滤。
+4. **文档待更正（不改用户文档，在此记录）。** `docs/uart_packet.md:21` 称
+   「`/dev/ttyACM0` 不是这块板的串口」，在本机被证伪：
+   `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00` 正指向 `ttyACM0`。
+   更要紧的是 **CANable2 与 CH340 都是 `/dev/ttyACM*`**，编号随插拔顺序变，
+   必须一律用 by-id，否则可能误占 `slcand` 正在用的 CAN 适配器端口。
 
 ## 10. 常见阻塞的排查入口
 
@@ -338,6 +407,27 @@ bash scripts/run.sh --backend sdk --mode monitor --model 2023 --can-port can0 --
 2. **URDF 的 KDL 警告可忽略。** `[kdl_parser]: The root link base_link has an
    inertia` 来自厂商 URDF，不影响关节读取。
 
-### 12.8 本节未做
+### 12.8 leader 遥操作器串流（已实测，仍未驱动真机）
 
-- 实机运动、遥操作串口接入、限位校准。
+`docs/uart_packet.md` 的规格在本机对真实串流验证过（纯解析、`--backend mock`、不碰 CAN）：
+
+```bash
+ls -l /dev/serial/by-id/
+# usb-1a86_USB_Single_Serial_5AE8010651-if00 -> ../../ttyACM0   (leader, CH340)
+# usb-Openlight_Labs_CANable2_..._20734831-if00 -> ../../ttyACM1 (USB2CAN)
+
+bash scripts/run.sh --mode teleop --backend mock \
+  --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00 \
+  --decoder "$PWD/leader_decoder.py" --print-rate 5 --duration 5
+```
+
+- 实测 **798 帧 / 3.79 s ≈ 211 Hz**（规格写 200 Hz），`dropped=0 no_data=0 resets=0`，无错误。
+- 六个关节在该次运行中全部停在 0.0° 跨度。**无法区分「leader 静止」和文档 §2 的
+  「编码器先工作后冻结」**——要确认必须实际移动 leader，本轮没有做（见第 9.1 节缺口 2）。
+- 全程 mock 机械臂，**没有 arm 过、没有开 CAN、没有加载厂商库**。
+
+### 12.9 本节未做
+
+- 实机运动、限位校准、leader 角度标定。
+- 移动 leader 以确认编码器跨度（第 12.8 节的未决观察）。
+- 用 `--backend sdk` 试跑 leader teleop：门禁会拦下未标定的映射，这是预期行为。

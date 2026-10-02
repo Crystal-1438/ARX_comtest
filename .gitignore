@@ -12,3 +12,6 @@ dist/
 *.tar.gz
 *.zip
 .sdk/
+
+# Machine-specific leader calibration; copy leader_map.example.json to create it.
+leader_map.json
