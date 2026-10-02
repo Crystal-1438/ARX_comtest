@@ -181,6 +181,8 @@ bash scripts/run.sh --backend sdk --mode monitor --model 2023 --can-port can0
 不是重新认证的厂商限位；全部使用
 SDK 原始关节坐标、rad，不做该文件中的 GELLO 零位偏置。
 `max_speed` 单位 rad/s，`max_following_error` 单位 rad，`timeout` 单位秒。
+`td_r_deg` 是**逐关节**的加速度上限，单位 deg/s²——这是本文件里唯一用角度的地方，
+因为参考实现（`ref/adrc.c`）里的 `r` 就是这个量纲；示例值是 400/500/600/4000/1000/4000。
 
 ```bash
 bash scripts/run.sh --backend sdk --mode teleop --model 2023 \
@@ -188,8 +190,17 @@ bash scripts/run.sh --backend sdk --mode teleop --model 2023 \
   --limits /path/to/your-verified-limits.json
 ```
 
-默认控制循环 100 Hz，应用目标变化率上限 0.2 rad/s，250 ms 未收到有效目标则进入
-FAULT 并请求 SOFT。读取串口不阻塞，不完整帧不会延后超时；积压超过 4096 字节则报错。
+默认控制循环 100 Hz，250 ms 未收到有效目标则进入 FAULT 并请求 SOFT。
+读取串口不阻塞，不完整帧不会延后超时；积压超过 4096 字节则报错。
+
+**发给机械臂的不是目标，是一条轨迹**：每个关节有一个独立的跟踪微分器
+（`td.py`，逐项照抄 `ref/adrc.c` 的 `TDFunction_independent`），用该关节的
+`td_r_deg` 作为加速度上限，把目标跟踪过去。`td_r_deg` 越大跟得越紧、滞后越小，
+也越容易把输入的抖动放大；越小越平滑。`max_speed` 仍给轨迹的**速度**设上限：
+微分器限制的是加速度，它本身对速度没有上限，而机械臂跟得上多快由那条限制决定。
+轨迹在按 `a` 时从实测位置、零速度起步，所以使能本身不是一次跳变；它也**不会越过目标**，
+目标已经夹在范围内，所以发出去的指令不会自己跑出限位。角度用 mapper 解缠后的**多圈值**，
+不折回 0..360——折回去的话，每个关节经过 0/360 的那一次都会被当成整整一圈的阶跃。
 上电/启动不会回零。必须收到 `arm` 且 `deadman=true` 才以当前测量位置开始控制，
 同时捕获夹爪当前位置，避免切入厂商位置模式时跳到默认夹爪目标。
 本程序不提供遥操作夹爪或笛卡尔位姿控制，输入为六关节绝对目标。
@@ -544,7 +555,7 @@ def create_decoder():
 ```
 
 通过 `--decoder /path/to/controller_protocol.py` 加载。每批返回至多 64 个 Command，
-主循环仍会检查序号、deadman、限速和超时，越界的关节目标会被限幅（不是拒绝，
+主循环仍会检查序号、deadman、每个关节的加速度/速度上限和超时，越界的关节目标会被限幅（不是拒绝，
 见上文"超出 `--limits` 是限幅，不是停机"）。解码器应快速返回，不做阻塞 I/O。
 
 ## 本次验证边界（2026-10-02）

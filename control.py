@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 
 from protocol import Command, ProtocolError, vector6
+from td import Tracker
 
 
 @dataclass(frozen=True)
@@ -13,6 +14,11 @@ class Limits:
     max_speed: float = 0.2
     max_following_error: float = 0.15
     timeout: float = 0.25
+    # The tracking differentiator's acceleration bound, per joint. Degrees per
+    # second squared, unlike everything else in here, because that is the unit
+    # the reference gives r in and the trajectory is integrated in degrees --
+    # see td.py for why, and for what the per-joint split buys.
+    td_r_deg: tuple = (400.0, 500.0, 600.0, 4000.0, 1000.0, 4000.0)
 
     def __post_init__(self):
         vector6(self.lower)
@@ -22,6 +28,10 @@ class Limits:
         for value in (self.max_speed, self.max_following_error, self.timeout):
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError("speed, following error and timeout must be positive")
+        if (not isinstance(self.td_r_deg, (list, tuple)) or len(self.td_r_deg) != 6
+                or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                       for value in self.td_r_deg)):
+            raise ValueError("td_r_deg must be six positive degrees per second squared")
 
     def outside(self, joints):
         """Which joints are past the envelope, each with its value and its bounds.
@@ -75,6 +85,12 @@ class Controller:
         # input keeps asking for more, which is a thing the operator can see and
         # undo, not a reason to end the session.
         self.saturated = []
+        # The commanded trajectory: one tracking differentiator per joint, in
+        # degrees (td.py). It is the command rather than a filter on the way to
+        # it -- what the loop writes is what this returns -- which is what keeps
+        # the following-error check below comparing against the one trajectory
+        # the arm was actually asked to follow.
+        self.tracker = Tracker()
         # Optional veto on enabling the arm, called with the measured joints.
         # Returning a reason refuses the arm and shows the reason; returning
         # None allows it. It belongs to the caller -- nothing here knows what
@@ -124,6 +140,9 @@ class Controller:
                     return
             self.commanded = self.target = measured
             self.saturated = []  # The measured pose just passed the check above.
+            # The trajectory starts where the arm is, at rest. Anywhere else and
+            # the first tick would command a move the leader never asked for.
+            self.tracker.reset(tuple(math.degrees(q) for q in measured))
             self.arm.start(measured)
             self.state = "ACTIVE"
             self.reason = "armed at measured position"
@@ -182,13 +201,14 @@ class Controller:
         # The tracker is the only check here; the envelope is not compared
         # against again. Every command this loop sends is inside it -- arming is
         # refused unless the arm starts inside, the target is clamped, and the
-        # slew limit ramps between two in-range points, so the command cannot
-        # leave on its own. The arm can sit a little past a bound, and that is
-        # the point: a clamp parks the command on the bound, and an arm servoing
-        # onto it lags outside by up to the following error. An absolute test
-        # would fault on the arm doing what it was just told to do, which is the
-        # session-ending outcome the clamp exists to avoid. Anything further out
-        # than the lag is a tracking failure and is caught here.
+        # trajectory approaches that target without passing it, so the command
+        # cannot leave on its own. The arm can sit a little past a bound, and
+        # that is the point: a clamp parks the command on the bound, and an arm
+        # servoing onto it lags outside by up to the following error. An
+        # absolute test would fault on the arm doing what it was just told to
+        # do, which is the session-ending outcome the clamp exists to avoid.
+        # Anything further out than the lag is a tracking failure and is caught
+        # here.
         #
         # A fault, not an exception: this runs outside the loop's decoder guard,
         # so raising here would leave the state machine by way of main() and take
@@ -198,10 +218,17 @@ class Controller:
                for q, actual in zip(self.commanded, feedback)):
             self.stop("joint following error", fault=True)
             return feedback
-        step = self.limits.max_speed * dt
+        # Degrees are the differentiator's unit (r is deg/s^2), so the handover
+        # happens here, on both sides of the one call, and the rest of the file
+        # stays in vendor radians. ``max_speed`` still caps the commanded rate:
+        # the differentiator bounds acceleration and says nothing about speed,
+        # and the rate the arm can follow without falling behind is what that
+        # limit is for.
         self.commanded = tuple(
-            q + max(-step, min(step, target - q))
-            for q, target in zip(self.commanded, self.target)
-        )
+            math.radians(angle) for angle in self.tracker.step(
+                tuple(math.degrees(q) for q in self.target),
+                self.limits.td_r_deg,
+                dt,
+                math.degrees(self.limits.max_speed)))
         self.arm.write_joints(self.commanded)
         return feedback

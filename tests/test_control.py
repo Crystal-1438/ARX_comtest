@@ -50,13 +50,90 @@ class ControlTests(unittest.TestCase):
         self.arm_controller()
         self.assertEqual(self.control.target, (0.3,) * 6)
 
-    def test_slew_limit_and_deadman(self):
+    def test_the_command_is_a_trajectory_and_the_deadman_stops_it(self):
+        # A step in the target is not passed straight through: the command is
+        # the trajectory the joint's acceleration bound allows (td.py), so the
+        # first tick moves by a few thousandths of a radian and the second by
+        # more than the first -- it is still speeding up, which is the whole
+        # point of not having a constant-rate ramp.
         self.arm_controller()
         self.control.handle(Command("target", 2, (0.5,) * 6, True), 0.01)
         self.control.tick(0.01)
-        self.assertAlmostEqual(self.arm.positions[0], 0.002)
-        self.control.handle(Command("target", 3, (0.5,) * 6, False), 0.02)
+        first = self.arm.positions[0]
+        self.assertGreater(first, 0.0)
+        self.assertLess(first, 0.01)
+        self.control.tick(0.02)
+        second = self.arm.positions[0] - first
+        self.assertGreater(second, first)
+        self.assertLess(self.arm.positions[0], 0.5)
+        self.control.handle(Command("target", 3, (0.5,) * 6, False), 0.03)
         self.assertFalse(self.arm.active)
+
+    def test_the_trajectory_never_passes_the_target(self):
+        # The target is clamped into the envelope, so a trajectory that never
+        # passes it is what keeps the command inside the envelope. One target
+        # per tick, or the command timeout would end the run first.
+        self.control = Controller(self.arm, Limits((-1,) * 6, (1,) * 6, max_speed=2.0), 0)
+        self.arm_controller()
+        for step in range(1, 400):
+            self.control.handle(Command("target", step + 1, (0.9,) * 6, True), 0.01 * step)
+            self.control.tick(0.01 * step)
+            for q in self.control.commanded:
+                self.assertLessEqual(q, 0.9 + 1e-12)
+        self.assertAlmostEqual(self.control.commanded[0], 0.9, places=9)
+
+    def test_a_multi_turn_target_is_not_wrapped(self):
+        # The leader's angle is unwrapped by the mapper and can sit past a whole
+        # turn. Folded into 0..360 on the way to the differentiator, 370 would
+        # look like 10 and the trajectory would swing most of a turn the wrong
+        # way to reach it.
+        self.control = Controller(self.arm, Limits((-10.0,) * 6, (10.0,) * 6, max_speed=2.0), 0)
+        self.arm.positions = (math.radians(350.0),) * 6
+        self.arm_controller()
+        previous = self.arm.positions[0]
+        for step in range(1, 200):
+            self.control.handle(
+                Command("target", step + 1, (math.radians(370.0),) * 6, True), 0.01 * step)
+            self.control.tick(0.01 * step)
+            self.assertGreaterEqual(self.control.commanded[0], previous - 1e-12)
+            previous = self.control.commanded[0]
+        self.assertLess(abs(self.control.commanded[0] - math.radians(370.0)), math.radians(0.01))
+
+    def test_arming_starts_the_trajectory_where_the_arm_is(self):
+        # Arming must not be a step: the trajectory starts at the measured pose
+        # at rest, so the first tick commands that pose and nothing else.
+        self.arm.positions = (0.3,) * 6
+        self.arm_controller()
+        self.control.handle(Command("target", 2, (0.3,) * 6, True), 0.01)
+        self.control.tick(0.01)
+        for actual in self.arm.positions:
+            self.assertAlmostEqual(actual, 0.3, places=12)
+
+    def test_the_acceleration_bound_is_the_configured_one(self):
+        # Two loops, same step, different per-joint bound: the big one is the
+        # one that has travelled further. This is the wire from limits.json.
+        def after_one_tick(r_deg):
+            arm = MockArm()
+            control = Controller(arm, Limits((-1,) * 6, (1,) * 6, td_r_deg=(r_deg,) * 6), 0)
+            control.handle(Command("arm", 1, deadman=True), 0)
+            control.handle(Command("target", 2, (0.5,) * 6, True), 0.01)
+            control.tick(0.01)
+            return arm.positions[0]
+
+        self.assertGreater(after_one_tick(4000.0), after_one_tick(400.0))
+
+    def test_the_configured_rate_caps_the_trajectory(self):
+        # The bound is on acceleration; ``max_speed`` is what bounds the rate.
+        arm = MockArm()
+        control = Controller(arm, Limits((-1,) * 6, (1,) * 6, max_speed=0.01,
+                                         td_r_deg=(4000.0,) * 6), 0)
+        control.handle(Command("arm", 1, deadman=True), 0)
+        previous = 0.0
+        for step in range(1, 50):
+            control.handle(Command("target", step + 1, (1.0,) * 6, True), 0.01 * step)
+            control.tick(0.01 * step)
+            self.assertLessEqual(arm.positions[0] - previous, 0.01 * 0.01 + 1e-12)
+            previous = arm.positions[0]
 
     def test_timeout_latches_until_stop_then_arm(self):
         self.arm_controller()
@@ -171,6 +248,15 @@ class ControlTests(unittest.TestCase):
     def test_hardware_disable_is_rejected_before_sdk_construction(self):
         with self.assertRaises(UnsupportedStopMode):
             VendorArm("/nonexistent", "can0", "2023", "disabled")
+
+    def test_bad_acceleration_bounds_are_refused_at_construction(self):
+        # A zero or negative bound would divide by zero in the differentiator
+        # and a short tuple would silently leave joints on a default, so both
+        # are configuration errors rather than something to clamp at run time.
+        for bad in ((1.0,) * 5, (1.0,) * 7, (0.0,) * 6, (-1.0,) * 6,
+                    (1.0,) * 5 + ("400",), float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                Limits((-1,) * 6, (1,) * 6, td_r_deg=bad)
 
 
 class PreArmTests(unittest.TestCase):
@@ -289,7 +375,8 @@ class OperatorChannelTests(unittest.TestCase):
         self.control.operator_arm(0.1)
         self.arm.positions = (0.5,) * 6
         self.control.operator_arm(0.2)
-        # Re-anchoring mid-motion would silently discard the slew limit.
+        # Re-anchoring mid-motion would silently restart the trajectory from a
+        # pose the arm is not in.
         self.assertEqual(self.control.target, (0.0,) * 6)
 
     def test_local_stop_reports_why(self):

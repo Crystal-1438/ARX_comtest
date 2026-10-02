@@ -29,7 +29,10 @@ NO_DATA = b"-1,3281,1060,2353,2875,2085,500"
 REFERENCE = [79.5, 328.1, 106.0, 235.3, 287.5, 208.5]
 
 WIDE_LIMITS = {"lower": [-6.3] * 6, "upper": [6.3] * 6,
-               "max_speed": 2.0, "max_following_error": 0.5, "timeout": 0.25}
+               "max_speed": 2.0, "max_following_error": 0.5, "timeout": 0.25,
+               # Spelled out rather than left to the dataclass default, so the
+               # whole file the operator writes is what the run is given.
+               "td_r_deg": [400.0, 500.0, 600.0, 4000.0, 1000.0, 4000.0]}
 
 
 def leader_frame(record):

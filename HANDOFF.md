@@ -70,9 +70,10 @@ bash scripts/install_dependencies.sh --sdk --dry-run
 | `leader_map.py` | 单圈角度 → 关节弧度的标定映射；路径解析的唯一权威 |
 | `leader_calibrate.py` | 标定工具：`session` 交互采样（单点手输方向，或多点拟合）、`sample` 单次采样、`fit` 出映射；见第 6.2 节 |
 | `operator_keys.py` | 本地按键 arm/stop 通道（必须叫这个名字，见文件内注释） |
-| `control.py` | STOPPED / ACTIVE / FAULT 状态机、越界限幅、限速、超时、跟随误差 |
+| `control.py` | STOPPED / ACTIVE / FAULT 状态机、越界限幅、指令轨迹、超时、跟随误差 |
+| `td.py` | 参考实现 `ref/adrc.c` 的独立跟踪微分器（逐关节、单位为度、多圈角）；见第 12.23 节 |
 | `backends.py` | `MockArm` 与 `VendorArm`；真实 SDK 状态映射、构造/模式切换 |
-| `limits.example.json` | 六个关节的示例边界及限速参数；不是已核验实机配置 |
+| `limits.example.json` | 六个关节的示例边界、轨迹速度上限与逐关节加速度上限；不是已核验实机配置 |
 | `leader_map.example.json` | 遥操作器标定文件模板；用户复制为被忽略的 `leader_map.json` |
 | `scripts/install_dependencies.sh` | apt 包候选检查、venv/Python 依赖、调用 SDK 编译 |
 | `scripts/build_sdk.sh` | 架构/头文件/ldd 检查、构建、安装、只导入验证、READY 标记 |
@@ -162,7 +163,12 @@ G_COMPENSATION, END_CONTROL, POSITION_CONTROL }`（顺序即取值），`Control
 
 - 启动为 STOPPED；普通 target 不会使能。arm + deadman=true 以当前测量位置进入 ACTIVE。
 - 目标为六维 SDK 原始坐标绝对角度，单位 rad。没有 GELLO 偏置、角度/编码器自动推断。
-- 默认 max_speed=0.2 rad/s，max_following_error=0.15 rad，timeout=0.25 s。
+- 默认 max_speed=0.2 rad/s，max_following_error=0.15 rad，timeout=0.25 s；
+  默认 `td_r_deg`=(400, 500, 600, 4000, 1000, 4000) deg/s²（逐关节加速度上限，见第 12.23 节）。
+- 发出去的不是 target 而是**轨迹**：每个关节一个跟踪微分器（`td.py`），以该关节的
+  `td_r_deg` 为加速度上限把 target 跟踪过去，`max_speed` 再给轨迹的速度设上限。
+  轨迹在 arm 时从实测位置、零速度起步，且**不会越过 target**（因此不会自己出界）。
+  角度是 mapper 解缠后的**多圈值**，不折回 0..360。
 - ACTIVE 时 target 越过配置范围**只把该分量夹到边界并保持**（`Limits.clamp()`），
   不停止、不锁存，拉回范围内即恢复；arm 那一刻机械臂实测越界则拒绝 arm。见第 12.22 节。
 - ACTIVE 时有效 target 刷新超时；重复 arm 不刷新。先检查超时，再处理新数据，迟到帧不能自动恢复。
@@ -423,7 +429,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 285 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 304 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -440,6 +446,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | 状态行打印节流（离线） | `due_for_print` 直接单测：未到间隔不打、到点打、`state` 变立刻打、**`state` 不变而 `reason` 变也立刻打**、同一条不重复打；PTY 里把 `--print-rate` 压到 1 Hz 跑约 2 s，记录数必须仍是"几条"而不是随 100 Hz 控制循环走（**把 `next_print` 改成每轮都到期，这条即以 60+ 条失败**），见第 12.19 节 |
 | `--watch` 单人可读输出（离线） | `watch_line` 直接单测：六个关节的转角与 `+6.1f` 对齐、`out of pose` 点名列出的关节与容差、全部在容差内时写 `in the arm's pose, press a`、没帧时写 `waiting for the leader's first frame` 且**不打 J1**（打 0 会被读成"已经在姿态里"，是唯一错误答案）、ACTIVE/FAULT 只报状态与理由（ACTIVE 且有关节被限幅时尾部补 `at the limit: J3 J5`，测试里的假 controller 必须显式给 `saturated`——`Mock` 自动生成的属性为真且不可迭代）、没有 `distance()` 的解码器也能出一条行；PTY 里 `--watch` 真的打出**行**而不是 JSON（含 `J1`/`J6`、不含 `{`）、`a` 之前写 waiting、按 `a` 后下一行是 `ACTIVE ... armed at measured position`（成功 arm 会变 `state`，这条认不出节流退化；认得出的是 `PrintThrottleTests` 里"`state` 不变而 `reason` 变"那条）。见第 12.20 节 |
 | 越界限幅与点名（离线） | 目标越界**不限幅为异常、也不停机**：六个分量各自夹到边界、被夹的关节记进 `saturated`、控制保持 ACTIVE，再发一帧范围内的 target 即恢复（同一个序列继续）；被夹在边界上时机械臂滞后 0.05 rad（在 `max_following_error` 内）走完整拍而不 FAULT——**把 `tick()` 里那条绝对越界检查加回去，这条即以 FAULT 失败**；`stop()` 清空 `saturated`。**机械臂实测**越界仍然拒绝 arm，`Limits.outside()` 逐关节给 `J6 +2.000 not in [-1.000, +1.000]`，走 `refusing to arm: ...` 而**不是抛异常**（按键路在解码器 guard 之外，抛出去会退出 2）；机械臂离指令 2.0 rad 时由 `joint following error` 兜住，是 FAULT 而非异常（`tick` 在 guard 之外，抛出去会穿到 `main()` 退出 2、屏上只剩 ERROR）。见第 12.22 节 |
+| 指令轨迹：跟踪微分器（离线） | `td.py` 是 `ref/adrc.c` 的 `fst`/`TDFunction_independent` 逐项转写，用性质而非重算钉住：远场加速度恒等于 `r`、误差为零且静止时输出为 0、任意误差/速度下 `\|fst\| <= r`、静止时加速度方向与误差相反；六组 r × 五档 dt × 六种步长的**步响应从不越过目标**（这正是"指令不会自己出界"的依据）、最终停在目标上（1e-9）、速度被 `max_speed` 夹住、同一时刻 r 大的关节走得更远；**多圈**：350→370 单调穿过 360（不折回时把误差按 ±180 折一下即失败），700→730 照常收敛；`dt<=0` 原地不动、长度不符抛 `ValueError`。`control.py` 侧：arm 后第一拍就停在实测位置（步长 0 的跳变）、同一目标下一拍位移大于上一拍（还在加速）、全程不越过目标、`td_r_deg` 与 `max_speed` 分别可配置地起作用、多圈 target 穿过 360° 不回摆（`Limits((-10,)*6,(10,)*6)`）、`td_r_deg` 非法（长度、0、负数、字符串）在构造时报 `ValueError`。见第 12.23 节 |
 | `fit` 的锚点（离线） | 夹具把 session 的 `continuous_deg` 整体挪一圈（`raw` 不变）后，写出的 map 仍能被新 `Mapper` 从 `raw` 复现出记录的臂角；**把这一行改回 `continuous_deg` 该测试即以 360.0 的差值失败**（三条测试同时失败），见第 12.16 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
@@ -542,7 +549,8 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
    `-1` 判据完全抓不到这种坏法，而冻结值看起来是一个完美的稳定读数。
    需要「N ms 未变化」的存活性判定。本轮只计数/打印。
 3. **值域内的静默错误抓不到。** `2117 → 2717` 这种翻转仍落在 `0..3599` 内，
-   越界检查看不见。限速只限制单拍步长，长期仍会跟过去。需要可选的最大跳变过滤。
+   越界检查看不见。限速与指令轨迹只限制单拍步长和加速度，长期仍会跟过去（第 12.23 节）。
+   需要可选的最大跳变过滤。
 4. ~~**`unwrap` 的原点依赖"按基准姿态启动"**~~ —— **2026-10-03 已修，见第 6.3 节、
    第 12.15 节与第 12.18 节。** 修法换了两次：12.15 是"把第一帧与 `reference_deg`
    逐关节比对、超 10° 就拒绝 arm"，只能要求操作者把起点摆在唯一已知的圈上；12.18 改成
@@ -1313,3 +1321,68 @@ target 真的算到了界外（限位没校准、映射错）。停机意味着 
   看到那一行补出 `at the limit: J1`。
   **变异验证**：把 `clamp` 改成原样返回（不夹），这两个类加 `ControlTests` 共 5 条失败
   （`[5]` 变成 `[]`、`joints_rad[0]` 越过 0.05）；改回来即全绿。
+
+### 12.23 发给关节的指令改成跟踪微分器的轨迹（2026-10-03）
+
+**需求（操作者，原话）：** "参考 `ref/adrc.*`，使用其中的独立 td 跟踪微分器，对发给每个关节的
+角度进行处理，其中 r 参数（单位：角度）使用：400, 500, 600, 4000, 1000, 4000"；追加一句
+"注意要使用多圈角度"。
+
+**转写了什么、没转写什么。** 只取 `ref/adrc.c` 里与闭环无关的那一件：
+`TDFunction_independent()` 和它调用的 `fst()`（`adrc.c:81`，逐项照抄，含 `fsg` 的区域切换），
+放进新文件 `td.py`。同一个文件里的 `NLSEFFunction()`/`ESOFunction()`/`ADRCFunction()` **不用**：
+那是给"自己算力矩去驱动电机"的闭环用的（还要接陀螺/编码器做状态观测），而这里发给机械臂的
+是**位置指令**，闭环在厂商的位置模式里，外面再套一个 ESO 只会与厂商的伺服打架。
+
+**两个照做的前提，都是操作者指定的：**
+
+- **单位是度**。`r` 在参考实现里就是加速度上限，量纲 = 输入单位/秒²；输入用度，`r` 就是 deg/s²。
+  `Limits` 其余部分全是弧度，所以换算只发生在 `tick()` 里那一处交接（`math.degrees` /
+  `math.radians` 各一次），其余代码不动。
+- **多圈角**。`Mapper.to_radians()` 输出的是解缠后的连续角（`leader_map.py:258`），可能超过 360°
+  或为负；`math.degrees()` 原样保留圈数。**绝不折回 0..360**：折回去的话，关节每次经过
+  `0/360`，微分器看到的误差都会突然变成整整一圈，轨迹会朝反方向甩一圈去追一个没发生过的动作。
+  `test_td.py::test_a_multi_turn_angle_is_not_wrapped`（350→370 单调穿过 360）与
+  `test_control.py::test_a_multi_turn_target_is_not_wrapped`（`Limits((-10,)*6,(10,)*6)` 下
+  350°→370° 不回摆）钉住这一条；把误差按 ±180 折一下的变异体只被这一条抓到。
+
+**`max_speed` 保留为速度上限（这是一个选择，写在这里）。** 微分器限制的是加速度，对速度没有上限：
+对阶跃 Δ，峰值速度约 `sqrt(r*Δ)`。J4/J6 的 r=4000 在 30° 的阶跃上就要 ~338 deg/s ≈ 5.9 rad/s，
+而 `max_following_error`（0.6 rad）是拿指令与实测比的——真按这个速度发，机械臂跟不上就是
+`joint following error` → FAULT → `arm.stop()` → SOFT（零力矩）→ 下坠。所以轨迹的速度仍由
+`max_speed` 夹住（`0.2` 默认 / 现场配置 `2.0` rad/s = 114.6 deg/s）。**代价要说明白**：
+速度上限一旦顶住，`r` 只决定起步/刹车的形状，跟手快慢还是 `max_speed` 说了算——
+想让 `r` 成为唯一限制就得把 `max_speed` 调大，那也就等于把上面那条保护调松。
+
+**参数与状态：**
+
+- `h` = 本拍实测的 `dt`（`tick()` 里已有），`h0` = 2h，照 `adrc.h` 的调参说明取两倍。
+- 状态 `(角度, 角速度)` 就是**发出去的那条指令本身**（`step()` 返回什么就写什么），
+  所以状态不会与控制流分叉，跟随误差检查比的还是同一条轨迹。
+- arm 时 `reset(实测位置)`、零速度：否则第一拍就是一次没人要求的跳变。
+  `stop()` 之后不需要重置——下一次 arm 一律重置。
+
+**实测（离线仿真，100 Hz）：**
+
+- 阶跃 30°、r=400：峰值速度 102.8 deg/s（0.25 s 处），±0.05° 内收敛 0.62 s，**全程不越过目标**。
+  旧线性限速是 0.26 s 到达——新的更慢但两头是平滑的，这正是加速度上限换来的东西。
+- 斜坡跟踪（leader 匀速 100 deg/s，即 1.75 rad/s）的稳态滞后：r=400 为 14.5°，
+  r=4000 为 3.2°；速度跟得上（稳态速度误差为 0）。这就是逐关节 r 的用途——
+  基座关节滞后大一点、更平滑，腕关节跟得更紧。
+- 现场 `max_speed=2.0` 时上限开始顶住的阶跃：r=400 约 33° 以上，r=4000 约 3.3° 以上。
+
+**改动的文件：** `td.py`（新）、`control.py`（`Limits.td_r_deg` + `Controller.tracker` +
+`tick()` 里的交接）、`limits.example.json` 与现场 `limits.json`（补上 `td_r_deg`）、
+`tests/test_td.py`（新）、`tests/test_control.py`、`tests/test_leader_integration.py`
+（`WIDE_LIMITS` 显式写出 `td_r_deg`，让整份配置真的走一遍 JSON）、README 第「串口正常控制」节。
+
+**验证**（离线，**304 项通过**，比第 12.22 节多 19 项，见第 8 节）。变异验证：
+把轨迹改成直通（`step` 直接返回 target）失败 5 条；把每个关节的 r 固定成 4000 失败 4 条；
+把误差折回 ±180 失败 1 条（就是上面那条多圈测试）。`test_slew_limit_and_deadman` 原来钉的是
+"一拍走 `max_speed*dt`"，那条是旧限速器的行为，已改成钉轨迹（第一拍只走千分之几弧度、
+第二拍位移大于第一拍）。
+
+**遗留 / 操作者要知道的：** `ref/` 是未跟踪目录（文件头版权归哈工大（深圳）南工骁鹰机器人队，
+且依赖该工程自己的 `common.h`），**不提交**，只作为本次转写的出处；`td.py` 是转写而非引用。§12.22 里"限速在两个界内点之间插值（逐关节凸性）"这句话在新实现下由"轨迹不越过目标"
+承接（性质由 `test_a_step_is_approached_without_passing_it` 钉住），结论不变，措辞已过时。
+`limits.json` 的 `lower`/`upper` 仍未标定，与本次改动无关。
