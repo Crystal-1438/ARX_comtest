@@ -102,15 +102,17 @@ class WatchLineTests(unittest.TestCase):
     a wall of text at any rate anyone can watch, and it does not say what to do
     about it."""
 
-    def controller(self, state="STOPPED", reason="startup"):
-        controller = Mock(state=state, reason=reason)
+    def controller(self, state="STOPPED", reason="startup", saturated=()):
+        # `saturated` has to be given, not left to Mock: an auto-created
+        # attribute is truthy and uniterable, so the line would raise.
+        controller = Mock(state=state, reason=reason, saturated=list(saturated))
         return controller
 
     def decoder(self, reading):
         return Mock(distance=Mock(return_value=reading))
 
-    def line(self, reading, state="STOPPED", reason="startup"):
-        return watch_line("12:00:00", self.controller(state, reason),
+    def line(self, reading, state="STOPPED", reason="startup", saturated=()):
+        return watch_line("12:00:00", self.controller(state, reason, saturated),
                           (0.1,) * 6, self.decoder(reading))
 
     def test_it_shows_every_joint_s_turn_to_the_arm_s_pose(self):
@@ -146,6 +148,15 @@ class WatchLineTests(unittest.TestCase):
         # joints are following it.
         line = self.line(None, state="ACTIVE", reason="armed at measured position")
         self.assertEqual(line, "12:00:00 ACTIVE  | armed at measured position")
+
+    def test_while_armed_it_says_which_joints_are_held_at_a_bound(self):
+        # An arm holding at a clamped limit looks exactly like an arm lagging
+        # behind the leader; the joint that ran out of envelope is the whole
+        # difference, and it is what tells the operator to bring the leader back.
+        line = self.line(None, state="ACTIVE", reason="armed at measured position",
+                         saturated=[2, 4])
+        self.assertEqual(
+            line, "12:00:00 ACTIVE  | armed at measured position  | at the limit: J3 J5")
 
     def test_a_fault_reports_its_reason(self):
         line = self.line(None, state="FAULT", reason="no data from the leader board")

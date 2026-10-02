@@ -180,14 +180,22 @@ def watch_line(clock, controller, joints, decoder):
     stopped -- how far each joint still has to be turned to be in the pose the
     arm is in, which is the number the operator is moving the leader to zero.
     The gate and this display are the same measurement, so the line turns good
-    exactly when pressing a would work.
+    exactly when pressing a would work. While armed it is the other end of the
+    same envelope: which joints the clamp is holding at their bound.
 
     A decoder need not offer it; one that does not gets the state alone, which
     is all a wire protocol with its own arm/stop can be watched for.
     """
     line = f"{clock} {controller.state:<7}"
     if controller.state != "STOPPED":
-        return f"{line} | {controller.reason}"
+        # A clamped arm holds still while the leader keeps being pushed, and
+        # without this the line would look exactly like an arm lagging behind.
+        # Which joint is at its bound is the only thing that says whether the
+        # session is following the hand or has run out of envelope.
+        saturated = list(controller.saturated)
+        held = ("  | at the limit: " + " ".join(f"J{index + 1}" for index in saturated)
+                if saturated else "")
+        return f"{line} | {controller.reason}{held}"
     distance = getattr(decoder, "distance", None)
     reading = distance(joints) if distance is not None else None
     if reading is None:

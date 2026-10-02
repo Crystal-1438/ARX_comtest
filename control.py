@@ -27,10 +27,11 @@ class Limits:
         """Which joints are past the envelope, each with its value and its bounds.
 
         A list of strings, empty when everything is inside. Named rather than
-        counted because the fault line is the only place the joint, the value and
-        the configured range can be compared -- and this file is not calibrated
-        against the arm (limits.example.json is a starting point, not a
-        measurement), so the comparison is exactly what the operator has to make.
+        counted because the refusal line is the only place the joint, the value
+        and the configured range can be compared -- and this file is not
+        calibrated against the arm (limits.example.json is a starting point, not
+        a measurement), so the comparison is exactly what the operator has to
+        make.
         """
         joints = vector6(joints)
         return [f"J{index + 1} {q:+.3f} not in [{lo:+.3f}, {hi:+.3f}]"
@@ -38,13 +39,24 @@ class Limits:
                 in enumerate(zip(joints, self.lower, self.upper))
                 if not lo <= q <= hi]
 
-    def check(self, joints):
+    def clamp(self, joints):
+        """The joints brought inside the envelope, and which ones had to be.
+
+        Returns ``(clamped, saturated)``: a tuple safe to command, and the indices
+        that were asking for somewhere the envelope does not allow. Saturation
+        rather than a stop, because the input going out of range is not
+        distinguishable here from a hand pushing the leader a degree too far past
+        a joint that is already at its bound -- and stopping on that ends the
+        session, drops the arm to zero torque and lets it fall, which is a worse
+        outcome than holding at the limit. Reversible, too: only the command is
+        clamped, never the mapping, so pulling the leader back resumes exactly
+        where it left off.
+        """
         joints = vector6(joints)
-        outside = self.outside(joints)
-        if outside:
-            raise ProtocolError("joint position outside configured limits: "
-                                + ", ".join(outside))
-        return joints
+        clamped = tuple(min(max(q, lo), hi)
+                        for q, lo, hi in zip(joints, self.lower, self.upper))
+        saturated = [index for index, (q, c) in enumerate(zip(joints, clamped)) if q != c]
+        return clamped, saturated
 
 
 class Controller:
@@ -58,6 +70,11 @@ class Controller:
         self.last_tick = now
         self.target = None
         self.commanded = None
+        # Joint indices whose last target had to be clamped into the envelope.
+        # Reported, never acted on: the arm is holding at the bound while the
+        # input keeps asking for more, which is a thing the operator can see and
+        # undo, not a reason to end the session.
+        self.saturated = []
         # Optional veto on enabling the arm, called with the measured joints.
         # Returning a reason refuses the arm and shows the reason; returning
         # None allows it. It belongs to the caller -- nothing here knows what
@@ -73,6 +90,9 @@ class Controller:
         self.state = "FAULT" if fault else "STOPPED"
         self.reason = reason
         self.target = self.commanded = None
+        # Nothing is being held at a bound once there is no command at all, and
+        # a stale list would be read as one by whoever prints the state.
+        self.saturated = []
         self.arm.stop()
 
     def _apply(self, kind, joints, now):
@@ -103,12 +123,13 @@ class Controller:
                     self.stop(f"refusing to arm: {blocker}")
                     return
             self.commanded = self.target = measured
+            self.saturated = []  # The measured pose just passed the check above.
             self.arm.start(measured)
             self.state = "ACTIVE"
             self.reason = "armed at measured position"
             self.last_input = self.last_tick = now
         elif self.state == "ACTIVE":
-            self.target = self.limits.check(joints)
+            self.target, self.saturated = self.limits.clamp(joints)
             self.last_input = now
 
     def handle(self, command, now):
@@ -158,16 +179,21 @@ class Controller:
         if dt < 0 or dt >= self.limits.timeout:
             self.stop("control loop timing fault", fault=True)
             return feedback
+        # The tracker is the only check here; the envelope is not compared
+        # against again. Every command this loop sends is inside it -- arming is
+        # refused unless the arm starts inside, the target is clamped, and the
+        # slew limit ramps between two in-range points, so the command cannot
+        # leave on its own. The arm can sit a little past a bound, and that is
+        # the point: a clamp parks the command on the bound, and an arm servoing
+        # onto it lags outside by up to the following error. An absolute test
+        # would fault on the arm doing what it was just told to do, which is the
+        # session-ending outcome the clamp exists to avoid. Anything further out
+        # than the lag is a tracking failure and is caught here.
+        #
         # A fault, not an exception: this runs outside the loop's decoder guard,
         # so raising here would leave the state machine by way of main() and take
         # the process with it -- the arm would stop with no reason on the screen
-        # and no way to press stop. The arm being past the envelope is the same
-        # class of event as the following error below.
-        outside = self.limits.outside(feedback)
-        if outside:
-            self.stop("the arm is outside the configured limits: " + ", ".join(outside),
-                      fault=True)
-            return feedback
+        # and no way to press stop.
         if any(abs(q - actual) > self.limits.max_following_error
                for q, actual in zip(self.commanded, feedback)):
             self.stop("joint following error", fault=True)

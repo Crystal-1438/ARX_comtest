@@ -69,6 +69,7 @@ class LeaderHarness(unittest.TestCase):
 
     PRINT_RATE = "100"
     EXTRA_ARGS = ()
+    LIMITS = WIDE_LIMITS
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -76,7 +77,7 @@ class LeaderHarness(unittest.TestCase):
         mapping = Path(self.directory.name) / "leader_map.json"
         mapping.write_text(json.dumps(self.mapping_config()), encoding="utf-8")
         limits = Path(self.directory.name) / "limits.json"
-        limits.write_text(json.dumps(WIDE_LIMITS), encoding="utf-8")
+        limits.write_text(json.dumps(self.LIMITS), encoding="utf-8")
 
         self.master, self.slave = pty.openpty()
         self.addCleanup(os.close, self.master)
@@ -402,6 +403,50 @@ class RolloverTests(LeaderHarness):
         self.assertAlmostEqual(record["leader"]["frame"]["target_rad"][0],
                                math.radians(-11.0))
         self.wait_for(lambda r: r["joints_rad"][0] < -0.19, self.NEXT)
+
+
+class PushedPastAJointBound:
+    """One joint's worth of evidence that an out-of-range input does not end a run.
+
+    The shared map is built for the mock arm's rest pose, so the arm sits at zero
+    and the leader's own J1 is inverted: a leader reading 75.5 where that pose
+    calls for 79.5 asks the arm's J1 for +4.0 deg. The configured upper bound
+    here is +0.05 rad (2.9 deg), and every other joint is left exactly where the
+    arm already is, so the clamp is about J1 alone.
+    """
+
+    LIMITS = dict(WIDE_LIMITS, upper=[0.05] + [6.3] * 5)
+    NUDGED = b"755,3281,1060,2353,2875,2085,500"
+
+
+class ClampedTargetTests(PushedPastAJointBound, LeaderHarness):
+    def test_the_run_continues_and_the_arm_stops_at_the_bound(self):
+        self.press_arm()
+        self.wait_for(lambda r: r["state"] == "ACTIVE", CAPTURED)
+        record = self.wait_for(lambda r: r["joints_rad"][0] > 0.04, self.NUDGED)
+        # Not stopped and not faulted: the arm is where the bound is, holding,
+        # and the leader is still being read -- the run is intact.
+        self.assertEqual(record["state"], "ACTIVE")
+        self.assertLessEqual(record["joints_rad"][0], 0.05)
+        # Only the command was clamped. The decoder still resolved the leader's
+        # own angle, and it is past the bound -- which is the thing that would
+        # have ended the session before.
+        self.assertGreater(record["leader"]["frame"]["target_rad"][0], 0.05)
+
+
+class ClampedWatchLineTests(PushedPastAJointBound, LeaderHarness):
+    """The line has to say the arm is held, or it reads as merely slow."""
+
+    EXTRA_ARGS = ("--watch",)
+
+    def test_the_line_names_the_joint_held_at_its_bound(self):
+        # Armed through the text readout, the way an operator does it in this
+        # mode: the record waits above never see JSON here.
+        self.wait_for_text("in the arm's pose, press a", CAPTURED)
+        self.press(b"a")
+        line = self.wait_for_text("at the limit: J1", self.NUDGED)
+        self.assertIn("ACTIVE", line)
+        self.assertIn("armed at measured position", line)
 
 
 if __name__ == "__main__":

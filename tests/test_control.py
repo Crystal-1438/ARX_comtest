@@ -79,20 +79,52 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.control.handle(Command("target", 1, (0,) * 6, True), 0.1)
         with self.assertRaises(ProtocolError):
-            self.control.handle(Command("target", 2, (2,) * 6, True), 0.1)
-        with self.assertRaises(ProtocolError):
-            self.control.handle(Command("target", 3, (math.inf,) * 6, True), 0.1)
+            self.control.handle(Command("target", 2, (math.inf,) * 6, True), 0.1)
 
-    def test_an_out_of_range_target_names_the_joint_and_both_numbers(self):
-        # "joint position outside configured limits" is the whole message
-        # otherwise, and with six joints in the arm that leaves the operator to
-        # guess which one -- on a live run, the only place the joint, the value
-        # and the configured range can be compared is this line.
+    def test_an_out_of_range_target_is_clamped_named_not_fatal(self):
+        # The input going out of range must not end the session: stopping drops
+        # the arm to zero torque and lets it fall, which is worse than holding
+        # at the bound, and a hand pushing the leader a degree too far is not
+        # distinguishable here from a target that is genuinely out of range. The
+        # joint that had to be held is named so the operator can see why the arm
+        # stopped following.
         self.arm_controller()
-        with self.assertRaises(ProtocolError) as caught:
-            self.control.handle(
-                Command("target", 2, (0.0, 1.5, 0.0, 0.0, 0.0, 0.0), True), 0.01)
-        self.assertIn("J2 +1.500 not in [-1.000, +1.000]", str(caught.exception))
+        self.control.handle(
+            Command("target", 2, (0.0, 1.5, 0.0, 0.0, 0.0, 0.0), True), 0.01)
+        self.assertEqual(self.control.state, "ACTIVE")
+        self.assertEqual(self.control.target, (0.0, 1.0, 0.0, 0.0, 0.0, 0.0))
+        self.assertEqual(self.control.saturated, [1])
+        # Only the command is clamped, never the mapping: pulling the leader
+        # back inside resumes exactly where it left off.
+        self.control.handle(
+            Command("target", 3, (0.0, 0.5, 0.0, 0.0, 0.0, 0.0), True), 0.02)
+        self.assertEqual(self.control.target, (0.0, 0.5, 0.0, 0.0, 0.0, 0.0))
+        self.assertEqual(self.control.saturated, [])
+
+    def test_the_arm_lagging_past_a_bound_is_not_a_fault_of_its_own(self):
+        # A clamped command parks on the bound, and an arm servoing onto it sits
+        # a little past -- here J6, 0.05 past a 1.0 bound and well inside the
+        # 0.15 following error. That lag is the tracker's business; an absolute
+        # test against the envelope faults on the arm obeying the clamped
+        # command, which is the outcome the clamp exists to avoid.
+        self.arm.positions = (1.0,) * 6
+        self.arm_controller()
+        self.control.handle(Command("target", 2, (1.0,) * 5 + (2.0,), True), 0.01)
+        self.assertEqual(self.control.saturated, [5])
+        self.arm.positions = (1.0,) * 5 + (1.05,)
+        self.control.tick(0.02)
+        self.assertEqual(self.control.state, "ACTIVE")
+        # The command stays on the bound rather than chasing the arm out.
+        self.assertEqual(self.arm.positions, (1.0,) * 6)
+
+    def test_stopping_clears_the_saturated_joints(self):
+        # Nothing is being held at a bound once there is no command, and the
+        # readout prints this list as the state it is in.
+        self.arm_controller()
+        self.control.handle(Command("target", 2, (2.0,) * 6, True), 0.01)
+        self.assertEqual(self.control.saturated, list(range(6)))
+        self.control.handle(Command("stop", 3), 0.02)
+        self.assertEqual(self.control.saturated, [])
 
     def test_arming_an_arm_already_outside_the_envelope_is_refused_not_fatal(self):
         # The arm resting a fraction past its configured range is a real case:
@@ -106,16 +138,21 @@ class ControlTests(unittest.TestCase):
         self.assertIn("J6 +2.000 not in [-1.000, +1.000]", self.control.reason)
         self.assertFalse(self.arm.active)
 
-    def test_the_arm_s_own_feedback_outside_the_envelope_faults_and_does_not_raise(self):
-        # This check runs outside the loop's decoder guard, so raising would
-        # leave the state machine by way of main() and take the process with it:
-        # the arm would stop with an ERROR line instead of a state the operator
-        # can read and clear.
+    def test_an_arm_far_from_the_command_faults_and_does_not_raise(self):
+        # The envelope is no longer compared against feedback -- the command is
+        # the thing that is kept inside it -- but an arm this far from what it
+        # was told to do is caught by the tracker, which is the check that
+        # actually bounds how far outside the arm can end up.
+        #
+        # A fault and not an exception: this runs outside the loop's decoder
+        # guard, so raising would leave the state machine by way of main() and
+        # take the process with it -- the arm would stop with an ERROR line
+        # instead of a state the operator can read and clear.
         self.arm_controller()
         self.arm.positions = (0.0, 0.0, 0.0, 0.0, 0.0, 2.0)
         self.control.tick(0.01)
         self.assertEqual(self.control.state, "FAULT")
-        self.assertIn("J6 +2.000 not in [-1.000, +1.000]", self.control.reason)
+        self.assertEqual(self.control.reason, "joint following error")
         self.assertFalse(self.arm.active)
 
     def test_following_error_stops(self):
