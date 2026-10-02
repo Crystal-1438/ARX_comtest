@@ -311,20 +311,33 @@ bash scripts/run.sh --mode preflight --backend sdk --model 2023 --can-port can0
 - 只要本进程发过帧，`candump` / RX 计数就**不能**当作"机械臂在线"的证据；
 - 只有在**完全不发送**的纯监听窗口里 `RX = 0` 才可信（本机实测：6 秒静默无帧）。
 
-### 12.6 当前判定边界
+### 12.6 实机连通性（已证实）
 
-- ✅ PC → CANable2 → `slcan` → `can0`：链路正常（接口 UP、ERROR-ACTIVE、固件有响应）。
-- ✅ 波特率 1 Mbps（`-s8`）与 ARX 文档一致。
-- ❓ **适配器 → 机械臂的线上连通性尚未证实。** 原因：厂商 SDK 走
-  `ExchangeData`/`[ReadData]` 主站轮询，从机不主动广播，空闲静默属预期；
-  且该 SLCAN 固件不向内核回报线上 ACK 失败，**没有纯软件判据**。
-  曾发 200 帧扩展帧（ID `1FFFFFFF`）作 ACK 探测，`cansend` 全部成功、
-  计数器无错误，但按上述原因这不构成"线上被 ACK"的证据。
-- 用户已确认：CAN_H/CAN_L 已接到机械臂、机械臂已上电、实物型号 **2023**（type=0，`x5.urdf`）。
-- ⚠️ **现场没有外部急停。** 任何会构造 `InterfacesPy` 的步骤都可能使能电机；
-  在没有急停且未支撑的前提下不要执行。
+```bash
+bash scripts/run.sh --backend sdk --mode monitor --model 2023 --can-port can0 --duration 3
+```
 
-### 12.7 本节未做
+- 退出码 **0**。SDK 打印 `SocketCAN adapter created` → `Successfully bound socket to
+  interface N` → `ReciveThread running` → `Init completed`。
+- **读到变化中的真实六关节反馈**（30 次采样，各关节跨度 0.0006–0.019 rad），
+  说明主机与电机是双向通信，不是全零占位值。当时机械臂停在近零位姿。
+- 退出时状态为 `STOPPED / reason=program exit / stop_mode=soft`，厂商线程正常收尾
+  （`[ArmThread] finish close` → `ReciveThread finish` → `CAN socket destroyed`）。
+- 结论：**PC → CANable2 → `slcan` → SocketCAN → 机械臂全链路连通。**
+  适当前提：用户已确认 CAN_H/CAN_L 已接线、机械臂已上电、实物型号 **2023**
+  （type=0，`x5.urdf`）。
 
-- `--mode monitor` 读取六关节角度（需构造机械臂，未执行）。
-- 实机运动、遥操作串口接入。
+### 12.7 两条重要观察
+
+1. **SDK 的关闭路径会调用 DisableMotor。** 退出日志出现 `[ArmThread] DisableMotor`。
+   核心库确实有 `setEnableMotor`/`packDisableMotor` 符号，但 Python 的
+   `InterfacesPy` **没有公开这套接口**，且它只在析构/关闭时发生，**无确认反馈，
+   也不能在进程存活期间主动进入**。因此第 1 节"停止用 SOFT 零力矩"的结论不变，
+   不要把退出时的这次调用等同于可操作的运行期失能模式。若确实需要运行期失能，
+   仍要厂商提供正式 API 与失能后读取反馈的说明。
+2. **URDF 的 KDL 警告可忽略。** `[kdl_parser]: The root link base_link has an
+   inertia` 来自厂商 URDF，不影响关节读取。
+
+### 12.8 本节未做
+
+- 实机运动、遥操作串口接入、限位校准。
