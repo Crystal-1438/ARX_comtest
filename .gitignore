@@ -18,3 +18,6 @@ leader_map.json
 
 # Poses captured by leader_calibrate.py; also machine-specific.
 calibration_session.jsonl
+
+# Joint limits verified against the real arm; start from limits.example.json.
+limits.json
