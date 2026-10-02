@@ -3,6 +3,10 @@
 更新时间：2026-10-02。本文面向另一个 coding agent，目标是无需阅读历史对话即可继续工作。
 面向操作者的安装与运行说明在 [README.md](README.md)。
 
+> 本文记录了两台不同的机器：第 1–11 节出自一台 Ubuntu 26.04 工作机，
+> 第 12 节出自连接了 USB2CAN 与机械臂的 Robot PC（Ubuntu 22.04）。
+> 两节的结论不可互相覆盖，尤其"SDK 能否加载"在两台机器上答案不同。
+
 ## 1. 当前目标与已经确认的需求
 
 用户要求一个独立 Python 工程，通过 USB2CAN 控制 ARX X5 机械臂，提供：
@@ -239,3 +243,88 @@ git archive --format=tar.gz --prefix=ARX_comtest/ --output=../ARX_comtest.tar.gz
 
 推送成功以实际命令结果为准；出现权限/网络阻塞时保留本地提交并准确报告。
 不要因为所有模拟测试通过就将“实机联调”标记为完成。
+
+## 12. Robot PC 实机环境记录（2026-10-02，与第 8 节不同的机器）
+
+本节是连接了 USB2CAN 与 ARX 机械臂的那台 PC 的实测结果。**不要用第 8 节
+（Ubuntu 26.04 工作机）的结论覆盖本节，反之亦然。**
+
+### 12.1 环境（已实测）
+
+- Ubuntu 22.04.5 LTS (Jammy) / x86_64 / Python 3.10.12。
+- 交互式 shell 已 source **ROS 2 Humble**，`LD_LIBRARY_PATH` 含 `/opt/ros/humble/lib`。
+  厂商核心库依赖的 `libkdl_parser.so`、`liburdf.so` 正是由它提供，`liborocos-kdl.so`
+  来自 `/lib/x86_64-linux-gnu`。这些路径**没有**写进 `/etc/ld.so.conf.d/`，
+  所以在未 source ROS 的 shell 里 `ldd` 会报 not found —— 那是环境没加载，
+  不是缺依赖。**第 8 节"本机缺 KDL 运行库"的结论不适用于本机。**
+- 因此本机满足 `--skip-system` 条件，无需 apt 安装 `libkdl-parser-dev`。
+
+### 12.2 SDK 重编译（已完成）
+
+```bash
+bash scripts/install_dependencies.sh --sdk --skip-system
+```
+
+- 用系统 python3.10 建 `.venv`，装了 pyserial 3.5 / numpy 2.2.6 / pybind11 3.1.0。
+- 两个绑定按 `cpython-310` 重编译并安装到 `.sdk`，写入 `.sdk/READY`（内容 `cpython-310`）。
+- 脚本自检输出 `SDK Python imports passed. No robot was constructed or commanded.`
+
+这是仓库自带 `cpython-312` 扩展在本机不可用的正解：**用本机解释器重编译**，
+不是改名或软链接。
+
+### 12.3 preflight（已通过）
+
+```bash
+bash scripts/run.sh --mode preflight --backend sdk --model 2023 --can-port can0
+# 退出码 0；errors 为空；sdk_import: ok (no arm constructed)
+```
+
+只证明扩展可导入、`can0` 是 SocketCAN，**不证明机械臂在线或反馈新鲜**。
+
+### 12.4 USB2CAN 适配器（已实测）
+
+| 项目 | 实测结果 |
+| --- | --- |
+| 型号 | CANable2，USB `16d0:117e`，序列号 `207235C34831` |
+| 固件 | **SLCAN**（枚举为 CDC-ACM），不是 gs_usb 原生固件 |
+| 固件版本串 | `16e7497-dirty github.com/normaldotcom/canable2.git` |
+| 当前节点 | `/dev/ttyACM1` |
+
+- **`ip link set can0 type can bitrate …` 路线不适用**，必须走 `slcand`：
+
+  ```bash
+  sudo slcand -o -f -s8 /dev/ttyACM1 can0   # -s8 = 1 Mbps
+  sudo ip link set can0 up
+  ```
+
+- `-f` 的语义是"读状态标志以复位错误状态"，**不是**前台运行（前台是 `-F`）。
+- 该固件是精简实现：只有 `V`（版本）有回显，标准 LAWICEL 的 `S`/`O`/`C`/`F`/`N`
+  都不返回任何字节，**无法用 `F` 读取适配器侧状态标志**。
+- `/dev/ttyACM0` 与 `/dev/ttyACM1` 的编号会在重新插拔后互换（dmesg 中已观察到多次）。
+  写脚本用稳定路径 `/dev/serial/by-id/usb-Openlight_Labs_CANable2_…-if00`。
+
+### 12.5 必须记住的坑：SocketCAN 本地回环
+
+发送帧时，`candump can0` 和 `ip -s link show can0` 的 RX 会计会**显示本进程自己发出的帧**。
+因此：
+
+- 只要本进程发过帧，`candump` / RX 计数就**不能**当作"机械臂在线"的证据；
+- 只有在**完全不发送**的纯监听窗口里 `RX = 0` 才可信（本机实测：6 秒静默无帧）。
+
+### 12.6 当前判定边界
+
+- ✅ PC → CANable2 → `slcan` → `can0`：链路正常（接口 UP、ERROR-ACTIVE、固件有响应）。
+- ✅ 波特率 1 Mbps（`-s8`）与 ARX 文档一致。
+- ❓ **适配器 → 机械臂的线上连通性尚未证实。** 原因：厂商 SDK 走
+  `ExchangeData`/`[ReadData]` 主站轮询，从机不主动广播，空闲静默属预期；
+  且该 SLCAN 固件不向内核回报线上 ACK 失败，**没有纯软件判据**。
+  曾发 200 帧扩展帧（ID `1FFFFFFF`）作 ACK 探测，`cansend` 全部成功、
+  计数器无错误，但按上述原因这不构成"线上被 ACK"的证据。
+- 用户已确认：CAN_H/CAN_L 已接到机械臂、机械臂已上电、实物型号 **2023**（type=0，`x5.urdf`）。
+- ⚠️ **现场没有外部急停。** 任何会构造 `InterfacesPy` 的步骤都可能使能电机；
+  在没有急停且未支撑的前提下不要执行。
+
+### 12.7 本节未做
+
+- `--mode monitor` 读取六关节角度（需构造机械臂，未执行）。
+- 实机运动、遥操作串口接入。
