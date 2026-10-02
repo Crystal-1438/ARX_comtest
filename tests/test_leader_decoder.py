@@ -219,6 +219,34 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("+90.0", blocker)
         self.assertEqual(decoder.last_telemetry["reference"]["worst_joint"], 2)
 
+    def test_the_refusal_says_how_far_to_turn_as_well_as_how_far_off(self):
+        # The two numbers answer different questions and are different sizes: a
+        # joint ten degrees from the calibrated pose reads as 350 degrees away,
+        # and 350 is what the arm would be commanded. The literal difference is
+        # why this is refused; the turn is what the operator has to do about it,
+        # and leading with only the first makes a small move look like a large
+        # one -- which is exactly how this message was read the first time.
+        decoder = self.decoder(reference=[354.0, 328.1, 106.0, 235.3, 287.5, 208.5])
+        feed(decoder, b"40,3281,1060,2353,2875,2085,500")
+        blocker = decoder.startup_blocker
+        self.assertIn("-350.0", blocker)  # what the arm would be commanded
+        self.assertIn("-10.0", blocker)   # what the operator has to turn
+        self.assertIn("354.0", blocker)   # and what it has to read instead
+
+    def test_the_refusal_names_every_joint_that_is_out(self):
+        # Naming only the worst would send the operator round the restart loop
+        # once per joint: the verdict is latched, so a joint fixed after the
+        # fact still needs a new process to be noticed.
+        reference = list(VALID_DEG)
+        reference[0] = 30.0
+        reference[2] = 16.0
+        decoder = self.decoder(reference=reference)
+        feed(decoder, VALID)
+        blocker = decoder.startup_blocker
+        self.assertIn("J1", blocker)
+        self.assertIn("J3", blocker)
+        self.assertEqual(decoder.last_telemetry["reference"]["worst_joint"], 2)
+
     def test_arming_before_any_frame_arrives_is_refused(self):
         # Otherwise the first key press is a race the gate always loses.
         self.assertIn("no leader frame", self.decoder().startup_blocker)

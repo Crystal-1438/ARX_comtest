@@ -266,9 +266,19 @@ bash scripts/run.sh --mode teleop --backend mock \
 FAULT 后必须先按 `s` 再按 `a`，与线协议恢复语义一致。
 
 `a` 有一个前置条件：**至少要收到过一帧，且这一帧要落在 map 记录的基准姿态附近**。
-不满足就不会 arm，`reason` 里写的是为什么（例如 `refusing to arm: the leader started +90.0 deg
-from the calibrated pose (J3, tolerance 10 deg); ...`），机械臂一个目标都不会收到。
-理由见下面「基准姿态」一节。
+不满足就不会 arm，`reason` 里逐关节写出**要转到哪儿**和**为什么**，机械臂一个目标都不会收到：
+
+```
+refusing to arm: the leader is not in the calibrated pose: J2 reads 14.2 deg and has to
+read 322.8 (turn it -51.4 deg); J5 reads 41.3 deg and has to read 309.7 (turn it -91.6
+deg). Arming here would command J2 -308.6 deg away from where it belongs and J5 -268.4
+deg away from where it belongs (tolerance 10 deg). Put the leader in that pose and restart
+```
+
+注意这是**两个不同的数**，别混：`turn it -51.4 deg` 是你要转多少（最短圈，符号是方向），
+而 `-308.6 deg away` 是**机械臂会被命令偏多少**——mapper 在第一帧令 `continuous = raw`，
+所以误差就是字面差，单圈编码器只看得到读数，`-51.4` 那一转落地后读数正好是 322.8。
+判据用的是后者，见下面「基准姿态」一节。
 
 ### 标定：接实机之前必须做
 
@@ -398,10 +408,20 @@ bash scripts/calibrate.sh fit calibration_session.jsonl --out leader_map.json
 而偏掉之后的目标位置对关节限位来说是个完全正常的位置，控制环里没有任何东西能看出不对。
 
 所以运行期会核对：**第一帧**与 `reference_deg` 逐关节比较，任何一个关节超出
-`REFERENCE_TOLERANCE_DEG`（10°）就拒绝 arm，并点名最差的那个关节。
+`REFERENCE_TOLERANCE_DEG`（10°）就拒绝 arm，并把**所有**不合格的关节列出来
+（只报最差的一个会让人修完 J2 重启、再被告知 J5 也不合格）。
 比较用的是**直接相减**而不是最近圈——`0/360` 的另一侧只差 10° 物理角，
 读数却是 350°，而 mapper 也只能按 350° 去发（这时候它还没有历史可以展开）。
 `leader.reference` 里能看到每关节的差值和 `ok`。
+
+拒绝信息里同时给两个数，因为它们回答的是不同的问题，而且大小可能差很远：
+
+- `turn it -51.4 deg`——**你要转多少**，最短圈，符号是方向（这里的负号指读数变小、
+  经过 0）。`leader_map.shortest_turn()` 算的就是这个，只用于给人看。
+- `-308.6 deg away from where it belongs`——**机械臂会被命令偏多少**，就是字面差。
+  同一个关节可以只差 51.4° 而这里写成 308.6°，因为单圈编码器只报一个数，
+  而 mapper 在第一帧只能照那个数去发。判据用的是这个，不用最短圈：否则
+  "基准 354°、现在 4°"这种只差 10° 物理角的情形会被放过去，而它实际会命令 −350°。
 
 **在收到第一帧之前按 `a` 同样被拒绝**：否则先按键的人就绕过了这个检查。
 

@@ -6,7 +6,7 @@ import unittest
 
 from leader_map import (JOINTS, JointMap, LeaderMap, Mapper,
                         REFERENCE_TOLERANCE_DEG, check_reference, load_mapping,
-                        resolve_mapping_path, uncalibrated)
+                        resolve_mapping_path, shortest_turn, uncalibrated)
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "leader_map.example.json"
 
@@ -155,6 +155,39 @@ class ReferenceTests(unittest.TestCase):
     def test_refuses_angles_that_are_not_six_joints(self):
         with self.assertRaises(ValueError):
             self.check(self.REFERENCE[:5])
+
+
+class ShortestTurnTests(unittest.TestCase):
+    """The turnover the operator has to do, which is not the verdict.
+
+    ``check_reference`` measures the literal difference because that is what the
+    arm gets commanded; these are the same two angles measured as a physical
+    move. Keeping them apart is deliberate -- see the docstrings -- so they get
+    their own tests rather than being folded into the verdict's.
+    """
+
+    def test_a_short_move_the_other_way_is_short(self):
+        # 322.8 and 14.2 are 51.4 apart going down through zero, and 308.6 the
+        # other way. The verdict says 308.6; the turn has to say 51.4.
+        self.assertAlmostEqual(shortest_turn(322.8, 14.2), -51.4, places=6)
+
+    def test_it_is_the_short_way_round_the_rollover(self):
+        # Ten degrees past the reference, but the reading rolled over: the
+        # verdict is -350 (that is what the arm would be told) and the turn is
+        # ten degrees (that is what the hand has to do).
+        self.assertAlmostEqual(shortest_turn(354.0, 4.0), -10.0, places=6)
+        self.assertAlmostEqual(shortest_turn(4.0, 354.0), 10.0, places=6)
+
+    def test_no_turn_is_needed_where_the_pose_already_is(self):
+        for angle in (0.0, 14.2, 359.9):
+            with self.subTest(angle=angle):
+                self.assertAlmostEqual(shortest_turn(angle, angle), 0.0, places=6)
+
+    def test_the_turn_never_exceeds_half_a_turn(self):
+        for now in (0.0, 1.0, 180.0, 359.0):
+            for reference in (0.0, 90.0, 270.0, 359.0):
+                with self.subTest(now=now, reference=reference):
+                    self.assertLessEqual(abs(shortest_turn(reference, now)), 180.0 + 1e-9)
 
 
 class MapperTests(unittest.TestCase):

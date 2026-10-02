@@ -141,6 +141,20 @@ def load_mapping(path):
                      calibrated, str(path), _reference(config.get("reference_deg")))
 
 
+def shortest_turn(reference_deg, raw_deg):
+    """How far to turn a joint to get from where it reads to where it must read.
+
+    Guidance for whoever is moving the leader, and deliberately not a verdict.
+    On a single-turn encoder these two quantities are different sizes: a joint
+    tens of degrees from the reference reads as hundreds of degrees away, and
+    the large one is what the arm will be commanded (see ``check_reference``).
+    Both are worth saying -- one is the reason to refuse, the other is the
+    thing to do about it -- but they must not be confused, so they live in
+    separate functions with the sign carrying the direction of the turn.
+    """
+    return ((reference_deg - raw_deg + 180.0) % 360.0) - 180.0
+
+
 def check_reference(reference_deg, raw_deg, tolerance=REFERENCE_TOLERANCE_DEG):
     """How far a session's first frame sits from the pose the map was made at.
 
@@ -155,7 +169,10 @@ def check_reference(reference_deg, raw_deg, tolerance=REFERENCE_TOLERANCE_DEG):
     the wrap is not the small step it looks like here. Ten degrees past the
     reference on the other side of the 0/360 rollover reads as 350 degrees away
     -- and 350 degrees is what the mapper will command, because unwrapping only
-    starts once this first frame has fixed the origin.
+    starts once this first frame has fixed the origin. So the literal
+    difference *is* the commanded error, and the tolerance is applied to it.
+    ``shortest_turn`` is the same pair of angles measured as a physical move;
+    it belongs in the message to the operator, never in this verdict.
     """
     if len(reference_deg) != JOINTS or len(raw_deg) != JOINTS:
         raise ValueError(f"expected {JOINTS} angles")

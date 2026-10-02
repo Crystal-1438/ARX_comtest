@@ -19,7 +19,9 @@ Load it with ``app.py --decoder leader_decoder.py``.
 import re
 import time
 
-from leader_map import Mapper, check_reference, load_mapping, resolve_mapping_path
+from leader_map import (
+    Mapper, check_reference, load_mapping, resolve_mapping_path, shortest_turn,
+)
 from protocol import Command, ProtocolError
 
 FIELD_COUNT = 7
@@ -89,6 +91,8 @@ class LeaderUartDecoder:
         # wherever the origin moves. See startup_blocker.
         self.reference = None
         self.reference_pending = True
+        # That frame's angles, kept so the refusal can be phrased in them.
+        self.reference_frame = None
 
     @property
     def calibrated(self):
@@ -110,10 +114,27 @@ class LeaderUartDecoder:
             return "no leader frame has arrived yet"
         if not self.reference.get("checked") or self.reference["ok"]:
             return None
-        return (f"the leader started {self.reference['worst_deg']:+.1f} deg from the "
-                f"calibrated pose (J{self.reference['worst_joint'] + 1}, tolerance "
-                f"{self.reference['tolerance_deg']:.0f} deg); put the leader back in "
-                f"that pose and restart")
+        tolerance = self.reference["tolerance_deg"]
+        # Both numbers per joint, because one is the reason and the other is the
+        # task. A joint tens of degrees from the reference reads as hundreds of
+        # degrees away, and the hundreds are what the arm would be commanded;
+        # leading with those alone makes a small misplacement look like a large
+        # one. See check_reference and shortest_turn.
+        away = [(index, now, reference, offset)
+                for index, (now, reference, offset) in enumerate(zip(
+                    self.reference_frame, self.mapping.reference_deg,
+                    self.reference["offsets_deg"]))
+                if abs(offset) > tolerance]
+        # Every joint that is out, not just the worst: they all have to be
+        # moved, and naming one per restart sends the operator round again.
+        return ("the leader is not in the calibrated pose: " + "; ".join(
+            f"J{index + 1} reads {now:.1f} deg and has to read {reference:.1f} "
+            f"(turn it {shortest_turn(reference, now):+.1f} deg)"
+            for index, now, reference, _ in away) +
+            ". Arming here would command " + " and ".join(
+                f"J{index + 1} {offset:+.1f} deg away from where it belongs"
+                for index, _, _, offset in away) +
+            f" (tolerance {tolerance:.0f} deg). Put the leader in that pose and restart")
 
     def _restart_origin(self):
         """Re-anchor unwrapping, and ask for a fresh reference verdict.
@@ -123,6 +144,7 @@ class LeaderUartDecoder:
         """
         self.mapper.reset()
         self.reference_pending = True
+        self.reference_frame = None
 
     def reset(self):
         """Drop the half-line and the unwrap history after an upstream reset.
@@ -167,6 +189,7 @@ class LeaderUartDecoder:
             # This frame is the one the mapper will unwrap from, so this is the
             # last moment its distance from the calibrated pose can be measured.
             self.reference_pending = False
+            self.reference_frame = tuple(degrees)
             self.reference = self.judge_reference(degrees)
         return self.mapper.to_radians(degrees)
 
