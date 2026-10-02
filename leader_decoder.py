@@ -9,13 +9,17 @@ joint has never produced a sample". J7 is the gripper ADC. There is no
 checksum and no sequence number, so the only corruption this decoder can catch
 is a value that lands outside its documented range.
 
+A calibrated map also lets this decoder check that a session started at the
+pose the map was measured at, since its unwrapping origin is the first frame.
+``app.py`` refuses to arm until that check passes or proves it cannot run.
+
 Load it with ``app.py --decoder leader_decoder.py``.
 """
 
 import re
 import time
 
-from leader_map import Mapper, load_mapping, resolve_mapping_path
+from leader_map import Mapper, check_reference, load_mapping, resolve_mapping_path
 from protocol import Command, ProtocolError
 
 FIELD_COUNT = 7
@@ -80,10 +84,45 @@ class LeaderUartDecoder:
         self.last_frame = None
         self.last_telemetry = None
         self.mapper = Mapper(mapping)
+        # Verdict on the frame the mapper unwraps from, and whether one is still
+        # owed: every new origin needs its own verdict, so this is re-armed
+        # wherever the origin moves. See startup_blocker.
+        self.reference = None
+        self.reference_pending = True
 
     @property
     def calibrated(self):
         return self.mapping.calibrated
+
+    @property
+    def startup_blocker(self):
+        """Why the arm must not be armed yet, or None to allow it.
+
+        The mapper's origin comes from the first frame it sees, so a session
+        that began away from the calibrated pose cannot be corrected from here:
+        the answer is to stop and start again with the leader where it belongs.
+
+        Arming before any frame has arrived is refused too -- there is nothing
+        to judge yet, and allowing it would leave the gate open to whoever
+        presses the key first.
+        """
+        if self.reference is None:
+            return "no leader frame has arrived yet"
+        if not self.reference.get("checked") or self.reference["ok"]:
+            return None
+        return (f"the leader started {self.reference['worst_deg']:+.1f} deg from the "
+                f"calibrated pose (J{self.reference['worst_joint'] + 1}, tolerance "
+                f"{self.reference['tolerance_deg']:.0f} deg); put the leader back in "
+                f"that pose and restart")
+
+    def _restart_origin(self):
+        """Re-anchor unwrapping, and ask for a fresh reference verdict.
+
+        A new origin is exactly the thing that has to be judged again, so this
+        is the one place that moves it.
+        """
+        self.mapper.reset()
+        self.reference_pending = True
 
     def reset(self):
         """Drop the half-line and the unwrap history after an upstream reset.
@@ -97,7 +136,13 @@ class LeaderUartDecoder:
         The board announces its own reset with HANDSHAKE instead.
         """
         self.buffer.clear()
-        self.mapper.reset()
+        self._restart_origin()
+
+    def judge_reference(self, degrees):
+        """Compare the first frame with the calibrated pose, if the map has one."""
+        if self.mapping.reference_deg is None:
+            return {"checked": False, "why": "the map records no reference_deg"}
+        return check_reference(self.mapping.reference_deg, degrees)
 
     def _decode(self, fields):
         """Validate one packet. Returns radians, or None if the frame must be dropped."""
@@ -117,7 +162,13 @@ class LeaderUartDecoder:
             self.no_data += 1
             return None
         self.saw_valid = True
-        return self.mapper.to_radians([value / 10.0 for value in fields[:JOINTS]])
+        degrees = [value / 10.0 for value in fields[:JOINTS]]
+        if self.reference_pending:
+            # This frame is the one the mapper will unwrap from, so this is the
+            # last moment its distance from the calibrated pose can be measured.
+            self.reference_pending = False
+            self.reference = self.judge_reference(degrees)
+        return self.mapper.to_radians(degrees)
 
     def _publish(self, newest, error=None):
         """Record what the decoder last made of its input.
@@ -145,6 +196,7 @@ class LeaderUartDecoder:
             "dropped": self.dropped,
             "no_data": self.no_data,
             "resets": self.resets,
+            "reference": self.reference,
             "frame": self.last_frame,
         }
         if error is not None:
@@ -166,7 +218,7 @@ class LeaderUartDecoder:
                 if line == HANDSHAKE:
                     self.resets += 1
                     self.saw_valid = False
-                    self.mapper.reset()
+                    self._restart_origin()
                     continue
                 fields = parse_line(line)
                 if fields is None:
@@ -180,7 +232,7 @@ class LeaderUartDecoder:
                 raise ProtocolError("unterminated frame too long")
         except ProtocolError as exc:
             self.buffer.clear()
-            self.mapper.reset()
+            self._restart_origin()
             # Publish the counters even on the failing batch: this is the last
             # thing the operator sees before the arm latches FAULT.
             self._publish(None, error=str(exc))

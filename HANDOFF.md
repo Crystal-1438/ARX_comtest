@@ -204,6 +204,11 @@ J7 为夹爪 ADC（`0..1000`）。
 - `last_frame` 是**粘性**的，带 `host_monotonic`：打印频率低于流频率，约一半的记录落在
   没有新字节的循环上，空白帧会让健康流看起来是断的；**时间戳不动才是流停了**。
 - 声明 `provides_arm = False`：这块板只报位置，不报 arm/stop。
+- **基准姿态校验**（第 6.3 节）：第一帧与 map 的 `reference_deg` 逐关节比对，结果进
+  `last_telemetry["reference"]`；`startup_blocker` 非空时 `app.py` 拒绝 arm。
+  `unwrap` 的原点、`reset()`、握手行、`ProtocolError` 都会重新进入"待判"状态
+  （`_restart_origin()`），因为那几处都会换一个原点。`-1` 预热帧**不判**，
+  等第一帧六维有效帧——它才是 mapper 真正拿到的原点。
 
 **序号冲突的解法**（不要改回去）：decoder 的 `seq` 与 `controller.last_seq` 是两个独立
 空间。`control.py` 早就让 `stop` 豁免序号单调检查，现在把 `arm` 也纳入这条「操作员通道」
@@ -215,6 +220,13 @@ J7 为夹爪 ADC（`0..1000`）。
 `arm`/`stop` 而 `--operator-keys` 又没开时同样拒绝。理由见第 9 节缺口 1。两个检查都是
 decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` 不声明这两个属性，
 原有硬件路径不受影响。
+
+同一种 opt-in 形式还用在**运行期**：`app.apply_operator_arm()` 读 `decoder.startup_blocker`，
+非空就 `controller.stop("refusing to arm: ...")`（**不是** FAULT：这不是可以按 `s` 清掉的
+故障，`Mapper` 的原点已经定了，唯一出路是重启进程）。只在 `controller.state == "STOPPED"`
+时拦，否则连按 `a` 会把一个正在跑的目标停掉。`JsonLineDecoder` 没有这个属性，不受影响。
+线协议里的 `arm` 命令不经过这条路径——leader 解码器根本不发 `arm`（`provides_arm = False`），
+`check_decoder_for_hardware` 又强制这种解码器必须配 `--operator-keys`，所以本地按键是唯一入口。
 
 ### 6.2 标定工具（`leader_calibrate.py`）
 
@@ -295,6 +307,32 @@ decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` �
 - 写文件前先把它喂给 `leader_map.load_mapping` 读一遍——**加载器不收的映射比没有映射更糟**，
   因为门禁读的是同一个文件，会照样放行。
 
+### 6.3 基准姿态校验（为什么 offset 只在一点上成立）
+
+`offset_deg = arm_deg - sign * raw_deg`，是在**基准姿态**上解出来的；而 `Mapper` 把
+**进程收到的第一帧**当作展开原点（第一帧的 `continuous` 就等于它的 `raw`，见
+`leader_map.py` 的 `Mapper.to_radians`）。两者必须重合，否则整个映射被平移，
+**平移多少、机械臂就朝那个方向自己走多少**。这一点和标定注释里写的"差一圈偏 360°"
+是同一件事的更一般形式：偏 360° 只是其中最坏的一种。
+
+关键在于它**不安全地失败**：平移后的目标是个正常位置，六个关节里除了 J1 行程都 < 360°，
+J1 又几乎正好一圈，所以很多偏移量都落在限位之内，`Limits.check()` 看不见，
+`max_following_error` 也看不见——目标本身是自洽的，机械臂只是走到了一个没人要的位置。
+
+所以 `leader_map.check_reference()` 把第一帧和 `reference_deg` **直接相减**逐关节比较，
+任一关节超过 `REFERENCE_TOLERANCE_DEG`（10°）就 `ok: false`。三个刻意的选择：
+
+- **不用最近圈**（`shortest_delta`）。`0/360` 另一侧只差 10° 物理角，读数却是 350°，
+  而 mapper 这时候还没有历史可展开，它**只能**按 350° 发。用最近圈会把这个 session 放过去。
+- **10° 而不是 180°**。差值就是 arm 会被多走的量，所以要小；同时手摆回基准姿态的重复性
+  在几个度以内，10° 不会一直拦人。工具刚写完 map 时会把这条规则打印出来。
+- **`reference_deg` 缺失时不拦**（`{"checked": false, ...}`）。早于这个字段的 map 与手写
+  map 保持原样，只是**没有这层保护**，不是"查过了没问题"。`leader_calibrate.py` 生成的文件
+  都带这个字段（`build_map()` 写 `poses[0]["raw_deg"]`，取 raw 不取 continuous：
+  continuous 依赖**采集会话**从哪儿开始，运行期复现不了）。
+
+**收到第一帧之前按 `a` 也拒绝**：否则先按键的那个就绕过了整条检查。
+
 ## 7. 安装与运行环境
 
 应用 Python 3.10+；SDK 原装扩展是 Linux x86_64 / CPython 3.12。
@@ -327,7 +365,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 195 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 219 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -340,6 +378,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | SIGTERM 处理 | 真给自己发 SIGTERM：变成 `KeyboardInterrupt`（若未安装处理器，测试进程会被直接杀掉，不会静默通过）；处理前后 `SIGTERM` 处理器被恢复 |
 | 重力补偿真机 | **操作者反馈"基本能用"**（2026-10-03，未量化）：跑完过一次 `session --arm`（1 个 301 帧、0 坏帧的姿态，见第 12.14 节），据此认为状态 3 能托住机械臂，标定流程不需要再等它 |
 | 真机标定产物 | 已生成 `leader_map.json`（方向 `+ − − − + −`，手输，**未经第二姿态复核**），见第 12.14 节 |
+| 基准姿态门禁（离线） | `check_reference` 的边界与绕圈判据（跨 `0/360` 的 10° 报成 350°）；map 校验 `reference_deg` 的长度/数值/`0..360` 区间；解码器在首个有效帧判一次、`-1` 预热帧不判、握手与 `ProtocolError` 后重判、判过就锁定不再改；`reference_deg` 缺失时报告 `checked: false` 且不拦；PTY 端到端：起始帧正确→`a` 进 ACTIVE、起始帧偏 90°→`reason` 点名 J3 且 `joints_rad` 全程为 0（机械臂一个目标都没收到）、首帧之前按 `a` 被拒 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -400,13 +439,13 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
    `a` = arm、`s`（或空格）= stop，需要**真终端**（`--operator-keys`）。机械臂未 arm 时
    程序不会写任何目标。
 
-   - **启动前把 leader 摆回基准姿态**（`leader_map.json` 注释里的
-     `75.5, 322.8, 96.4, 258.0, 309.7, 218.4` 原始角度）。`unwrap` 从进程收到的第一帧数圈数，
-     差一圈 J1 的目标会整体偏 360°——**落在限位之内**，所以不会报警，只会走错。
-   - **按 `a` 之前是 STOPPED**，但 teleop 已经在读 leader 并打印。核对用的是
-     `leader.frame.angle_deg`：它必须等于上面那组基准角度，这是缺口 4 的人工替代。
-     （顺带的一个弱检查：如果机械臂**还停在标定时的零位**，`leader.frame.target_rad`
-     应当与 `joints_rad` 接近；机械臂已经动过就不能再用这条，它不是判据。）
+   - **启动前把 leader 摆回基准姿态**（`leader_map.json` 的 `reference_deg`：
+     `75.5, 322.8, 96.4, 258.0, 309.7, 218.4` 原始角度）。现在**程序自己会拦**
+     （第 6.3 节）：任意关节超过 10° 就拒绝 arm，`reason` 里点名那个关节与差值，
+     机械臂一个目标都不会收到；`leader.reference` 里有逐关节差值可以照着挪回去。
+     这仍然是必须做的一步，只是不用靠人记得做了。
+   - **按 `a` 之前是 STOPPED**，teleop 已在读 leader 并打印。**收到第一帧之前按 `a` 会被拒**，
+     所以先等 `leader.frame` 出现（这同时确认了流是活的）。
    - 只动**一个**关节一点点，确认机械臂同向；反向立刻按 `s`。方向是手输且未经复核的。
    - `limits.json` 目前只能用 `limits.example.json` 抄一份——**限位本身还没在实机上校准**，
      而它的 J2/J3 下限是 0.0，机械臂零位却在 0.006 rad 附近：反馈一旦略微为负，
@@ -425,14 +464,10 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
    需要「N ms 未变化」的存活性判定。本轮只计数/打印。
 3. **值域内的静默错误抓不到。** `2117 → 2717` 这种翻转仍落在 `0..3599` 内，
    越界检查看不见。限速只限制单拍步长，长期仍会跟过去。需要可选的最大跳变过滤。
-4. **`unwrap` 的原点依赖"按基准姿态启动"。** 六个关节的行程都 < 360°
-   （`limits.example.json`：J1 359.8°、J2 209°、J3/J4/J5 180°、J6 240°），
-   但 **J1 几乎正好一圈**，所以绕圈一定会被跨过，必须 `unwrap: true`。
-   而展开是从**进程收到的第一帧**数圈数的，标定时的基准姿态与运行期的起始帧
-   不一定同一个圈：差一圈，所有目标整体偏 360°，J1 会直接撞限位、其余关节也会
-   默默跟错。当前只靠"启动时把 leader 摆回基准姿态"这条操作约定，
-   **程序不校验**。正确做法是运行期校验起始帧落在基准姿态附近才允许 arm
-   （基准角度已写进 map 的 `comment`）。这要改 `leader_decoder` 与门禁，带自己的测试。
+4. ~~**`unwrap` 的原点依赖"按基准姿态启动"**~~ —— **2026-10-03 已修，见第 6.3 节与
+   第 12.15 节。** 运行期会把第一帧与 map 的 `reference_deg` 逐关节比对，超 10° 就拒绝 arm。
+   （原描述里"差一圈偏 360°"的说法不准确：单圈编码器**看不见**整圈差，
+   真正会发生的是一段可观察的起始偏置，见第 6.3 节。）
 5. **文档待更正（不改用户文档，在此记录）。** `docs/uart_packet.md:21` 称
    「`/dev/ttyACM0` 不是这块板的串口」，在本机被证伪：
    `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00` 正指向 `ttyACM0`。
@@ -730,3 +765,55 @@ arm `-0.08, 0.34, 0.60, 1.39, -0.01, 0.45` 度 —— **六轴全在 1.4° 以�
 原先依赖**工作目录里没有 `leader_map.json`**（解码器的默认路径就是 `./leader_map.json`），
 真机标定一做，这个门禁测试就会转而尝试打开串口并以 `SerialException` 失败。
 现在它显式指定一份未标定的 map 并用 `patch.dict(os.environ)` 隔离环境，与 cwd 无关。
+
+### 12.15 补上 9.1 缺口 4：运行期校验基准姿态（2026-10-03）
+
+用户选了缺口 4。这是**纯软件改动，全部离线验证**，没有碰真机、没有碰 SDK。
+
+**先说一处对缺口 4 原始描述的更正。** 原文写的是"标定时的基准姿态与运行期的起始帧
+不一定同一个圈：差一圈，所有目标整体偏 360°"。**整圈的差是看不见的**：
+单圈编码器在一圈之外报同样的读数，`Mapper` 以第一帧为原点，两边得到的 `continuous`
+完全一致，所以"差一圈"既不报警也不出错——它根本不是可观测的情形。
+真正会发生的是**一段可观察的起始偏置**：leader 起始原始角与 `reference_deg` 差多少，
+映射就整体平移多少，机械臂一 arm 就朝那个方向走多少。偏移后的位置对限位来说是个
+正常位置，`Limits.check()`、`max_following_error`、限速都看不见。
+第 6.3 节按这个语义重写了。
+
+**改动**：
+
+- `leader_map.py`：map 新增**结构化字段** `reference_deg`（基准姿态的原始角，
+  不再只写在 `comment` 里给人和正则看）；`check_reference()` 直接相减逐关节比对，
+  返回 `{checked, ok, tolerance_deg, worst_joint, worst_deg, offsets_deg}`；
+  `REFERENCE_TOLERANCE_DEG = 10.0`。缺字段 → `None`（老 map 与手写 map 照常加载）。
+- `leader_decoder.py`：首个**六维有效**帧判一次（`-1` 预热帧不判，它进不了 mapper）；
+  结果放进 `last_telemetry["reference"]`；`_restart_origin()` 统一了 `reset()`、
+  握手行与 `ProtocolError` 三处换原点的地方，三处都会**重新待判**；
+  `startup_blocker` 暴露拒绝理由，**没收到帧也返回理由**。
+- `app.py`：`apply_operator_arm()` 在 `STOPPED` 下看到 `startup_blocker` 就
+  `stop("refusing to arm: ...")`（不是 FAULT——原点已经定了，按 `s` 清不掉，
+  只能重启进程）。
+- `leader_calibrate.py`：`build_map()` 写 `reference_deg = poses[0]["raw_deg"]`，
+  注释里那段"差一圈偏 360°"的说法一并改掉。
+
+**关于 `reference_deg` 缺失时的取舍**：不拦，只在 `leader.reference` 里报
+`{"checked": false}`。理由是这与仓库既有门禁同构（`calibrated` / `provides_arm` 都是
+decoder 侧 opt-in，`JsonLineDecoder` 不声明就不受影响），而且缺失态是**"没有保护"**
+这个既有状态，不是**"已知错误"**——拦它反而会让所有老 map 直接不能跑。
+代价是这份 map 的 `reference_deg` 必须补上，否则这层保护对它是空的。
+**这件事已经做了**：仓库根目录那份 `leader_map.json`（gitignored）已加入
+`reference_deg`，值直接取自 `calibration_session.jsonl` 第一个姿态的 `raw_deg`，
+并逐关节用 `sign * raw + offset` 复算过，与同一姿态记录的 `arm_deg` 六维全部吻合到
+小数点后 4 位（J1 −0.0765、J2 0.3388、J3 0.6011、J4 1.3879、J5 −0.0109、J6 0.4481）。
+手工加的这一行**与重跑标定工具会写出的内容一致**，所以下次重标定不会产生差异。
+
+**验证**（全部离线，219 项通过）：`check_reference` 的边界与绕圈判据
+（跨 `0/360` 的 10° 报成 −350°，用最近圈就会放过去）；map 校验 `reference_deg` 的
+长度、数值类型与 `0..360` 区间；解码器的判一次/预热不判/换原点重判/判过即锁定/
+缺字段报告不拦；PTY 端到端跑真 `app.py`：起始帧正确 → `a` 进 ACTIVE，
+起始帧偏 90° → `reason` 点名 J3、`state` 停在 STOPPED、**全部记录的 `joints_rad` 为 0**
+（证明不是"停了"而是"一个目标都没发"），首帧之前按 `a` 被拒。
+
+**这次改动同时暴露的一件事（未修，见 12.16）**：`unwrap_from_reference` 的输入列是
+`pose["continuous_deg"]`，而单点路径用的是 `raw_deg`。对这份真机 session 而言
+**两者不等**（J2：`continuous_deg` = −37.2，`raw_deg` = 322.8），也就是当初若用 `fit`
+而不是单点，写出的 map 会在 J2 上整体偏 360°。

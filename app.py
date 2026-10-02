@@ -137,6 +137,23 @@ def check_decoder_for_hardware(decoder, operator_keys):
             "arm and to clear a latched fault; add --operator-keys")
 
 
+def apply_operator_arm(controller, decoder, now):
+    """Arm on the operator's key, unless the decoder says this session is bad.
+
+    The leader decoder fixes its unwrap origin on the first frame, so a session
+    that started away from the calibrated pose is off by that much on every
+    joint and cannot be corrected from here. Refusing leaves the reason on the
+    readout instead of walking the arm. Only the operator path needs this: a
+    decoder that can send ARM itself has to declare it, and this one declares it
+    cannot (``provides_arm``), which is what --operator-keys is for.
+    """
+    blocker = getattr(decoder, "startup_blocker", None)
+    if blocker and controller.state == "STOPPED":
+        controller.stop(f"refusing to arm: {blocker}")
+    else:
+        controller.operator_arm(now)
+
+
 def emit(controller, joints, backend, decoder=None):
     record = {
         "state": controller.state, "reason": controller.reason,
@@ -206,7 +223,7 @@ def run(args):
                 # wire frames already sitting in this iteration's buffer.
                 for action in operator.poll():
                     if action == "arm":
-                        controller.operator_arm(time.monotonic())
+                        apply_operator_arm(controller, decoder, time.monotonic())
                     else:
                         controller.operator_stop()
             if source:

@@ -6,9 +6,15 @@
     "offset_deg  leader angle that must map to the vendor zero for this joint.",
     "unwrap      true if the joint travels more than one full turn.",
     "calibrated  must be true before app.py will accept --backend sdk.",
+    "reference_deg  the raw leader angles at the pose the offsets were measured at.",
+    "            A teleop session has to start in that pose: the decoder unwraps",
+    "            from its first frame, so starting elsewhere shifts every target.",
+    "            leader_calibrate.py writes this; app.py refuses to arm when the",
+    "            first frame is more than 10 deg away on any joint.",
     "Values below are placeholders, not a calibration."
   ],
   "calibrated": false,
+  "reference_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
   "joints": [
     {"sign": 1, "offset_deg": 0.0, "unwrap": true},
     {"sign": 1, "offset_deg": 0.0, "unwrap": true},

@@ -248,6 +248,21 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("J3:", problems[0])
 
+    def test_the_map_records_the_pose_it_was_measured_at(self):
+        # Raw angles, not continuous ones: the runtime mapper takes its first
+        # frame as raw, so those are the numbers a session has to start in.
+        poses = session()
+        results, problems = fit_session(poses, 30.0, 0.05, 3.0)
+        self.assertEqual(problems, [])
+        config = fitted_map(poses, results)
+        self.assertEqual(config["reference_deg"], LEADER_POSES[0])
+        # And the field has to mean what the gate reads it as: through a fresh
+        # mapper it reproduces the arm angles recorded at that pose.
+        mapper = Mapper(check_map_loads(config))
+        for produced, expected in zip(mapper.to_radians(config["reference_deg"]),
+                                      poses[0]["arm_deg"]):
+            self.assertAlmostEqual(math.degrees(produced), expected, places=3)
+
     def test_build_map_and_the_loader_agree(self):
         poses = session()
         results, problems = fit_session(poses, 30.0, 0.05, 3.0)
@@ -578,9 +593,10 @@ class InteractiveTests(unittest.TestCase):
         for index, offset in enumerate(OFFSETS):
             self.assertEqual(mapping.joints[index].sign, 1)
             self.assertAlmostEqual(mapping.joints[index].offset_deg, offset, places=3)
-        # The reference pose has to be recoverable from the map, not just the numbers:
-        # a teleop session that starts anywhere else shifts every target a whole turn.
-        self.assertIn("81.7", (self.root / "leader_map.json").read_text(encoding="utf-8"))
+        # The reference pose has to be in the map as data, not only as prose: a
+        # session that starts anywhere else shifts every target by that much,
+        # and app.py has to be able to refuse to arm it.
+        self.assertEqual(mapping.reference_deg, tuple(LEADER_POSES[0]))
 
     def test_quitting_partway_keeps_the_poses_and_says_a_map_is_missing(self):
         arm = FakeArm([arm_for(pose) for pose in LEADER_POSES[:3]])

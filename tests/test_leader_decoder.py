@@ -15,6 +15,8 @@ def feed(decoder, *lines):
 
 
 VALID = b"795,3281,1060,2353,2875,2085,500"
+# VALID in degrees, which is what a reference pose is recorded in.
+VALID_DEG = [79.5, 328.1, 106.0, 235.3, 287.5, 208.5]
 
 
 class ParseTests(unittest.TestCase):
@@ -193,6 +195,80 @@ class StartupTransientTests(unittest.TestCase):
         decoder.reset()
         with self.assertRaises(ProtocolError):
             feed(decoder, b"-1,3281,1060,2353,2875,2085,500")
+
+
+class ReferenceTests(unittest.TestCase):
+    """The unwrap origin is the first frame, so a session that starts away from
+    the calibrated pose is off by that much before it moves at all."""
+
+    def decoder(self, reference=VALID_DEG):
+        return LeaderUartDecoder(LeaderMap(joints=(JointMap(),) * 6, calibrated=True,
+                                           reference_deg=reference))
+
+    def test_a_session_that_starts_at_the_reference_can_be_armed(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        self.assertIsNone(decoder.startup_blocker)
+        self.assertTrue(decoder.last_telemetry["reference"]["ok"])
+
+    def test_a_session_that_starts_elsewhere_cannot_be_armed(self):
+        decoder = self.decoder(reference=[79.5, 328.1, 16.0, 235.3, 287.5, 208.5])
+        feed(decoder, VALID)
+        blocker = decoder.startup_blocker
+        self.assertIn("J3", blocker)
+        self.assertIn("+90.0", blocker)
+        self.assertEqual(decoder.last_telemetry["reference"]["worst_joint"], 2)
+
+    def test_arming_before_any_frame_arrives_is_refused(self):
+        # Otherwise the first key press is a race the gate always loses.
+        self.assertIn("no leader frame", self.decoder().startup_blocker)
+
+    def test_the_verdict_is_latched_to_the_first_frame(self):
+        # The origin is already fixed by then; moving the leader back afterwards
+        # cannot make the session correct.
+        decoder = self.decoder(reference=[79.5, 328.1, 16.0, 235.3, 287.5, 208.5])
+        feed(decoder, VALID)
+        self.assertIsNotNone(decoder.startup_blocker)
+        feed(decoder, VALID)
+        self.assertIsNotNone(decoder.startup_blocker)
+
+    def test_a_warmup_frame_does_not_become_the_origin(self):
+        # The -1 frames are dropped before the mapper sees them, so the origin
+        # has to be the first real frame and the check has to wait for it.
+        decoder = self.decoder()
+        self.assertEqual(feed(decoder, b"-1,-1,-1,-1,-1,-1,500"), [])
+        self.assertIsNone(decoder.reference)
+        feed(decoder, VALID)
+        self.assertTrue(decoder.last_telemetry["reference"]["ok"])
+
+    def test_a_new_origin_is_judged_again(self):
+        # A board reset restarts the encoders, so the origin -- and therefore
+        # the thing being judged -- is new.
+        decoder = self.decoder(reference=[79.5, 328.1, 16.0, 235.3, 287.5, 208.5])
+        feed(decoder, VALID)
+        self.assertIsNotNone(decoder.startup_blocker)
+        self.assertEqual(feed(decoder, HANDSHAKE), [])
+        feed(decoder, b"796,3281,1060,2353,2875,2085,500")
+        # 79.6 against a reference of 79.5: only J3 was ever wrong.
+        self.assertIsNotNone(decoder.startup_blocker)
+        self.assertIn("J3", decoder.startup_blocker)
+
+    def test_a_reset_rejudges_against_whatever_comes_next(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        decoder.reset()
+        feed(decoder, b"30,3281,1060,2353,2875,2085,500")
+        self.assertIn("J1", decoder.startup_blocker)
+
+    def test_a_map_without_a_reference_is_reported_not_gated(self):
+        # Maps written before the field existed keep working, exactly as well
+        # as they did before it: the readout has to say they went unchecked.
+        decoder = LeaderUartDecoder(calibrated())
+        feed(decoder, VALID)
+        self.assertIsNone(decoder.startup_blocker)
+        reference = decoder.last_telemetry["reference"]
+        self.assertFalse(reference["checked"])
+        self.assertIn("reference_deg", reference["why"])
 
 
 class RangeTests(unittest.TestCase):
