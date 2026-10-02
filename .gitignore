@@ -15,3 +15,6 @@ dist/
 
 # Machine-specific leader calibration; copy leader_map.example.json to create it.
 leader_map.json
+
+# Poses captured by leader_calibrate.py; also machine-specific.
+calibration_session.jsonl

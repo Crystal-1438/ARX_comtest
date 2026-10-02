@@ -15,6 +15,7 @@ ARX_comtest/
 ├── protocol.py            # 可替换的串口帧解析器
 ├── leader_decoder.py      # 外接遥操作器 USART3 文本流解码器
 ├── leader_map.py          # 单圈角度到关节弧度的标定映射
+├── leader_calibrate.py    # 摆姿态采样并拟合出 leader_map.json
 ├── operator_keys.py       # 本地按键 arm/stop 通道
 ├── limits.example.json    # 关节限制示例
 ├── leader_map.example.json # 遥操作器标定示例
@@ -262,20 +263,46 @@ FAULT 后必须先按 `s` 再按 `a`，与线协议恢复语义一致。
 
 leader 报的是**单圈绝对角**，没有自己的零点。要变成关节弧度，需要每个关节的
 方向（`sign`）、零位（`offset_deg`）和是否多圈（`unwrap`）——**规格里没有，必须实测标定**。
+`leader_calibrate.py` 做这件事：**把机械臂和 leader 用手摆成同一个姿态**，同时读两边，
+摆几个不同姿态就能解出来。
+
+命令是只读的：不 arm、不发目标、不改状态（构造函数自己会进 SOFT）。
 
 ```bash
-cp leader_map.example.json leader_map.json   # 该文件已被 .gitignore 忽略
+# 每个姿态一条。--arm 会在同一进程里只读地取一次手臂角度。
+# 第一个姿态是基准姿态，后面必须从它开始。
+.venv/bin/python leader_calibrate.py sample --arm --model 2023 --can-port can0 \
+  --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00 \
+  --label "pose A"
+
+# 3 个姿态起，4 个更稳。然后：
+.venv/bin/python leader_calibrate.py fit calibration_session.jsonl --out leader_map.json
 ```
 
+- **每个关节都要动**：某个关节在所有姿态里几乎没变，拟合会拒绝它（跨度最小 30°）。
+- 姿态之间leader 每个关节的**真实行程不要超过半圈**，否则单圈编码器分不清正负绕行，拟合会拒绝。
+- `--arm` 需要 SDK 环境：先 `source scripts/env.sh`，或直接对着 `.sdk` 运行。
+
+输出是一张表：`关节 | leader 跨度 | 斜率 | sign | offset | 最大残差`。
+斜率就是方向，**因为两边关节配置相同，它必须≈±1**；明显不是 ±1 说明假设错了，
+工具会拒绝写文件而不是硬凑。最大残差衡量的是你把两边摆成"同一个姿态"的重复程度，
+几个度以内是正常的。
+
+**任一关节不通过就整个拒绝**（没有 `--force`）：半标定的映射比没标定更危险。
 公式是 `sdk_deg = sign * continuous_deg + offset_deg`（再转 rad）。
 **未标定的映射不会失败得很安全**：符号或零位错了，指向的是一个关节限位完全接受的
 真实位置。因此程序在 `--backend sdk` 的 teleop 下会**拒绝启动**，直到配置文件里
 写了 `"calibrated": true`；解码器发不出 `arm`/`stop` 而 `--operator-keys` 又没开时同样拒绝。
 `JsonLineDecoder` 不声明这两个属性，因此原有硬件路径不受影响。
 
+生成的 `leader_map.json` 里记了基准姿态的原始角度：**每次遥操作都要把 leader 摆在那个
+姿态再启动程序**，因为展开是从进程收到的第一帧开始数圈数的。
+
 已知缺口，接实机前必须处理：文档 §2 说编码器采到过数据后又断开会**冻结在最后一个有效值**，
 `-1` 判据抓不到这种坏法；值域内的静默错误（`2117 → 2717`）也抓不到。
-两者都需要额外的存活性/跳变判定。
+两者都需要额外的存活性/跳变判定。标定工具只会在采样窗口里提示 jitter 大不大，
+运行期还没有这个检查。另外绕圈原点只在"按基准姿态启动"的前提下成立，
+程序目前不校验起始帧，这一点见 [HANDOFF.md](HANDOFF.md) 第 9 节。
 
 ## 临时帧格式与后续替换
 

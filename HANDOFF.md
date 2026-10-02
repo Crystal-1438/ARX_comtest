@@ -68,6 +68,7 @@ bash scripts/install_dependencies.sh --sdk --dry-run
 | `protocol.py` | 临时 JSON 行协议；`Command`、`ProtocolError` 与 `feed(bytes)` 契约 |
 | `leader_decoder.py` | 外接遥操作器 USART3 文本流解码器；见第 6 节末的契约 |
 | `leader_map.py` | 单圈角度 → 关节弧度的标定映射；路径解析的唯一权威 |
+| `leader_calibrate.py` | 标定工具：`sample` 采姿态、`fit` 出映射；见第 6.2 节 |
 | `operator_keys.py` | 本地按键 arm/stop 通道（必须叫这个名字，见文件内注释） |
 | `control.py` | STOPPED / ACTIVE / FAULT 状态机、范围检查、限速、超时、跟随误差 |
 | `backends.py` | `MockArm` 与 `VendorArm`；真实 SDK 状态映射、构造/模式切换 |
@@ -189,6 +190,32 @@ J7 为夹爪 ADC（`0..1000`）。
 decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` 不声明这两个属性，
 原有硬件路径不受影响。
 
+### 6.2 标定工具（`leader_calibrate.py`）
+
+`sample` 采一个姿态，`fit` 把若干姿态拟合成 `leader_map.json`。**只读**：不 arm、
+不发 target；`--arm` 会构造 `InterfacesPy`（厂商线程、构造自己会进 SOFT），
+但只调 `read_joints()`，读完立即 `close()`；不加 `--arm` 则完全不碰 CAN、不加载厂商库。
+
+原理：把机械臂和 leader 用手摆成同一姿态并同时读两边。一个姿态给出 `offset`
+（前提是方向已知），姿态之间的变化给出方向。**第一个采的姿态是基准姿态**，
+`unwrap` 的圈数从它数起。
+
+已实现并已被测试固定的语义：
+
+- 复用 `app.SerialInput`（`exclusive=True`）与 `LeaderUartDecoder`——**不重写线格式**。
+  `SamplingDecoder` 只重写 `_decode`，把每个通过校验的帧记下来；采的是
+  `Mapper.continuous`，即**加 sign/offset 之前**的展开角，正是标定要求的量。
+- 窗口内每关节取**中位数**（一个翻转字节被多数票压掉）。**jitter（max−min）不是装饰**：
+  它才是"操作者没扶稳 / 这一帧被翻转"的报警信号，中位数只负责给出估计值。
+- 一帧坏帧只计数不致命（这不是安全路径），但会写进 pose 并在 sample 时提示。
+- 拟合用**相对基准姿态的最近圈**展开（`unwrap_from_reference`），与运行期 `Mapper`
+  从第一帧按最短路径展开的约定一致。真行程超过半圈时最短路径会选错圈，
+  此时斜率会明显偏离 ±1，**被拒绝而不是被将就**。
+- 判定：leader 跨度 ≥30°、|斜率| 与 1 的差 ≤0.05、最大残差 ≤3°。**任一关节不过就
+  整个拒绝、不写文件**（没有 `--force`）：只标定一半的映射比没标定更危险。
+- 写文件前先把它喂给 `leader_map.load_mapping` 读一遍——**加载器不收的映射比没有映射更糟**，
+  因为门禁读的是同一个文件，会照样放行。
+
 ## 7. 安装与运行环境
 
 应用 Python 3.10+；SDK 原装扩展是 Linux x86_64 / CPython 3.12。
@@ -221,10 +248,11 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 105 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 140 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
+| 标定工具测试 | 恒等/反向/带偏移、噪声、跨度不足、机械臂未动、非 1:1 斜率、姿态不互洽、跨绕圈点、拒绝写文件、生成的映射能被加载器读回并经 `Mapper` 复现采样到的臂角 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -254,10 +282,11 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
    preflight 只检查导入/设备，不证明电机在线或反馈新鲜。
 4. 支撑机械臂，先用 monitor 验证 SOFT 与六关节读数方向/单位，再校准限位。
    保留外部急停，验证停止/断流的实际行为；不要自动回零或发送示例绝对位置。
-5. leader 解码器已接入（第 6.1 节）。**下一步是标定，不是调参**：
-   先只解析（不加 `--operator-keys`，见 README「外接遥操作器」一节），逐个关节实测
-   `sign` / `offset_deg`，写进被忽略的 `leader_map.json` 并置 `"calibrated": true`；
-   门禁会一直挡着实机 teleop，直到这一步完成。
+5. leader 解码器已接入（第 6.1 节），标定工具已就绪（第 6.2 节）。
+   **下一步是摆姿态采数据**：`leader_calibrate.py sample --arm` 采 4 个姿态，
+   `fit --out leader_map.json`。用户已确认 leader 与 X5 关节配置相同、连杆长度略有差别，
+   所以拟合斜率必须≈±1；不通过就重摆姿态，不要放宽容差。
+   门禁会一直挡着实机 teleop，直到 `leader_map.json` 上写了 `"calibrated": true`。
 6. 标定之后再处理第 9.1 节列出的两个解码器缺口（冻结值、值域内静默错误），
    然后才做低速实机控制，并从 mock 换成 `--backend sdk`。
 7. 如要求真正失能，需厂商提供关闭/失能及失能后读反馈的正式 API/协议，当前不能承诺。
@@ -273,7 +302,15 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
    需要「N ms 未变化」的存活性判定。本轮只计数/打印。
 3. **值域内的静默错误抓不到。** `2117 → 2717` 这种翻转仍落在 `0..3599` 内，
    越界检查看不见。限速只限制单拍步长，长期仍会跟过去。需要可选的最大跳变过滤。
-4. **文档待更正（不改用户文档，在此记录）。** `docs/uart_packet.md:21` 称
+4. **`unwrap` 的原点依赖"按基准姿态启动"。** 六个关节的行程都 < 360°
+   （`limits.example.json`：J1 359.8°、J2 209°、J3/J4/J5 180°、J6 240°），
+   但 **J1 几乎正好一圈**，所以绕圈一定会被跨过，必须 `unwrap: true`。
+   而展开是从**进程收到的第一帧**数圈数的，标定时的基准姿态与运行期的起始帧
+   不一定同一个圈：差一圈，所有目标整体偏 360°，J1 会直接撞限位、其余关节也会
+   默默跟错。当前只靠"启动时把 leader 摆回基准姿态"这条操作约定，
+   **程序不校验**。正确做法是运行期校验起始帧落在基准姿态附近才允许 arm
+   （基准角度已写进 map 的 `comment`）。这要改 `leader_decoder` 与门禁，带自己的测试。
+5. **文档待更正（不改用户文档，在此记录）。** `docs/uart_packet.md:21` 称
    「`/dev/ttyACM0` 不是这块板的串口」，在本机被证伪：
    `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00` 正指向 `ttyACM0`。
    更要紧的是 **CANable2 与 CH340 都是 `/dev/ttyACM*`**，编号随插拔顺序变，
