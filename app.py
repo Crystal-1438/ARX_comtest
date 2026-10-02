@@ -14,6 +14,7 @@ import time
 
 from backends import MockArm, VendorArm, extension_path, load_sdk
 from control import Controller, Limits
+from operator_keys import KeyInput, NullInput
 from protocol import JsonLineDecoder, ProtocolError
 
 BUNDLED_SDK = Path(__file__).resolve().parent / "vendor/ARX_X5/py/arx_x5_python"
@@ -119,14 +120,37 @@ def preflight(args):
     return 2 if report["errors"] else 0
 
 
-def emit(controller, joints, backend):
-    print(json.dumps({
+def check_decoder_for_hardware(decoder, operator_keys):
+    """Refuse to move real motors with a decoder that cannot do the job.
+
+    Both checks are opt-in from the decoder side: a decoder that says nothing
+    about itself (JsonLineDecoder) is left alone, so the existing wire protocol
+    is unaffected.
+    """
+    if getattr(decoder, "calibrated", None) is False:
+        raise ValueError(
+            "decoder is not calibrated: fill in leader_map.json and set \"calibrated\": true "
+            "(see leader_map.example.json) before driving hardware")
+    if getattr(decoder, "provides_arm", True) is False and not operator_keys:
+        raise ValueError(
+            "decoder cannot send arm or stop, which the controller needs both to enable the "
+            "arm and to clear a latched fault; add --operator-keys")
+
+
+def emit(controller, joints, backend, decoder=None):
+    record = {
         "state": controller.state, "reason": controller.reason,
         "backend": backend, "stop_mode": controller.arm.stop_mode,
         "joints_rad": list(joints),
         "joints_deg": [round(math.degrees(q), 4) for q in joints],
         "host_read_monotonic": time.monotonic(),
-    }, ensure_ascii=False), flush=True)
+    }
+    # What the decoder last made of its input. joints_deg above is arm feedback,
+    # so while nothing is armed this is the only way to watch a live stream.
+    telemetry = getattr(decoder, "last_telemetry", None)
+    if telemetry is not None:
+        record["leader"] = telemetry
+    print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
 def run(args):
@@ -139,11 +163,19 @@ def run(args):
         raise ValueError("--demo is only for mock teleop")
     if args.mode == "teleop" and not (args.serial or args.demo):
         raise ValueError("teleop requires --serial (or --demo with mock)")
+    if args.operator_keys and args.mode != "teleop":
+        raise ValueError("--operator-keys only applies to teleop")
     limits = load_limits(args.limits, hardware and args.mode == "teleop")
     if 1 / args.rate >= limits.timeout:
         raise ValueError("control period must be shorter than command timeout")
+    if args.leader_map:
+        # Decoders are loaded through the argument-free create_decoder() contract,
+        # so the override travels by environment rather than by parameter.
+        os.environ["ARX_LEADER_MAP"] = str(args.leader_map)
     decoder = decoder_from_path(args.decoder)
-    source = arm = controller = None
+    if hardware and args.mode == "teleop":
+        check_decoder_for_hardware(decoder, args.operator_keys)
+    source = arm = controller = operator = None
     interrupted = False
     previous_handlers = {}
 
@@ -157,6 +189,7 @@ def run(args):
         # Open serial before connecting motors so serial-open failure cannot enable an arm.
         if args.mode == "teleop":
             source = DemoInput() if args.demo else SerialInput(args.serial, args.baud)
+            operator = KeyInput() if args.operator_keys else NullInput()
         arm = (VendorArm(args.sdk_root, args.can_port, args.model, args.stop_mode)
                if hardware else MockArm(args.stop_mode))
         controller = Controller(arm, limits, time.monotonic())
@@ -168,6 +201,14 @@ def run(args):
             if args.duration and now - started >= args.duration:
                 break
             controller.watchdog(now)
+            if operator:
+                # Local keys go first: an operator STOP has to land before the
+                # wire frames already sitting in this iteration's buffer.
+                for action in operator.poll():
+                    if action == "arm":
+                        controller.operator_arm(time.monotonic())
+                    else:
+                        controller.operator_stop()
             if source:
                 try:
                     commands = decoder.feed(source.read())
@@ -178,10 +219,13 @@ def run(args):
                         if command.kind == "stop" or not command.deadman:
                             break  # Discard targets/ARM queued behind STOP in the same batch.
                 except ProtocolError as exc:
+                    # A decoder holding a half-written frame must drop it too, or
+                    # the next bytes get spliced onto a fragment of the last one.
+                    getattr(decoder, "reset", lambda: None)()
                     controller.stop(f"invalid serial input: {exc}", fault=True)
             joints = controller.tick(time.monotonic())
             if now >= next_print or controller.state != previous_state:
-                emit(controller, joints, args.backend)
+                emit(controller, joints, args.backend, decoder)
                 next_print = now + 1 / args.print_rate
                 previous_state = controller.state
             next_tick += 1 / args.rate
@@ -191,7 +235,7 @@ def run(args):
             else:
                 next_tick = time.monotonic()  # No burst of catch-up motion commands.
         controller.stop("program exit")
-        emit(controller, controller.arm.read_joints(), args.backend)
+        emit(controller, controller.arm.read_joints(), args.backend, decoder)
         return 0
     finally:
         try:
@@ -200,6 +244,8 @@ def run(args):
         finally:
             if source is not None:
                 source.close()
+            if operator is not None:
+                operator.close()  # Restores the terminal before the process exits.
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
 
@@ -223,6 +269,10 @@ def main(argv=None):
     parser.add_argument("--serial", help="teleoperation controller port, NOT the USB2CAN serial port")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--decoder", help="custom Python decoder file exposing create_decoder()")
+    parser.add_argument("--leader-map", type=Path,
+                        help="leader calibration JSON; overrides ARX_LEADER_MAP and leader_map.json")
+    parser.add_argument("--operator-keys", action="store_true",
+                        help="arm with 'a', stop with 's' on stdin; the leader wire has neither")
     parser.add_argument("--limits", type=Path, help="JSON limits in vendor joint coordinates/radians")
     parser.add_argument("--rate", type=positive, default=100.0)
     parser.add_argument("--print-rate", type=positive, default=10.0)

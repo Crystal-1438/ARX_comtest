@@ -103,6 +103,34 @@ class DecoderTests(unittest.TestCase):
         # The controller's watchdog must be free to fire on an idle line.
         self.assertEqual(decoder.feed(b""), [])
 
+    def test_the_last_frame_survives_a_batch_with_no_new_data(self):
+        # Print rate is below stream rate, so reports routinely land on a loop
+        # that consumed nothing; a blank frame there would look like a dead link.
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        stamped = decoder.last_telemetry["frame"]["host_monotonic"]
+        decoder.feed(b"")
+        frame = decoder.last_telemetry["frame"]
+        self.assertEqual(frame["fields"][0], 795)
+        # Stale, not re-dated: an unchanged stamp is how the operator sees that.
+        self.assertEqual(frame["host_monotonic"], stamped)
+
+    def test_counts_every_frame_not_just_the_ones_it_hands_over(self):
+        # The wire carries no sequence number, so a received-packet count is the
+        # only way to notice that the board is dropping frames.
+        decoder = self.decoder()
+        feed(decoder, VALID, b"0,0,0,0,0,0,0", b"1,1,1,1,1,1,1")
+        self.assertEqual(decoder.frames, 3)
+        self.assertEqual(decoder.seq, 1)  # only the newest one was emitted
+
+    def test_a_fresh_frame_moves_the_stamp(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        stamped = decoder.last_telemetry["frame"]["host_monotonic"]
+        feed(decoder, b"0,0,0,0,0,0,0")
+        self.assertGreaterEqual(decoder.last_telemetry["frame"]["host_monotonic"], stamped)
+        self.assertEqual(decoder.last_telemetry["frame"]["fields"][0], 0)
+
     def test_handshake_is_recognised_rather_than_counted_as_corruption(self):
         decoder = self.decoder()
         self.assertEqual(feed(decoder, HANDSHAKE), [])

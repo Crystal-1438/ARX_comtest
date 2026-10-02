@@ -13,6 +13,7 @@ Load it with ``app.py --decoder leader_decoder.py``.
 """
 
 import re
+import time
 
 from leader_map import Mapper, load_mapping, resolve_mapping_path
 from protocol import Command, ProtocolError
@@ -63,7 +64,12 @@ class LeaderUartDecoder:
         self.mapping = mapping
         self.max_frame_bytes = max_frame_bytes
         self.buffer = bytearray()
+        # seq counts commands handed to the controller, which is a batch at a
+        # time; frames counts packets actually received. They differ by however
+        # many frames arrived between control loop iterations, and the wire has
+        # no sequence number, so a packet rate is the only way to notice loss.
         self.seq = 0
+        self.frames = 0
         self.dropped = 0
         self.no_data = 0
         self.resets = 0
@@ -71,6 +77,7 @@ class LeaderUartDecoder:
         # carry -1 while the encoder waits for its first PWM period. That is a
         # startup transient, not a fault -- but only until a full frame lands.
         self.saw_valid = False
+        self.last_frame = None
         self.last_telemetry = None
         self.mapper = Mapper(mapping)
 
@@ -113,25 +120,35 @@ class LeaderUartDecoder:
         return self.mapper.to_radians([value / 10.0 for value in fields[:JOINTS]])
 
     def _publish(self, newest, error=None):
-        telemetry = {
-            "map_source": self.mapping.source,
-            "calibrated": self.calibrated,
-            "dropped": self.dropped,
-            "no_data": self.no_data,
-            "resets": self.resets,
-            "frame": None,
-        }
-        if error is not None:
-            telemetry["error"] = error
+        """Record what the decoder last made of its input.
+
+        The frame is sticky: print rate is lower than the stream rate, so about
+        half of all reports land on a loop that consumed no new bytes, and a
+        blank frame on those would make a healthy stream look dead. Freshness is
+        carried by the stamp instead -- an unchanged stamp means the values on
+        screen are stale.
+        """
         if newest is not None:
             fields, radians = newest
-            telemetry["frame"] = {
+            self.last_frame = {
                 "seq": self.seq,
                 "fields": list(fields),
                 "angle_deg": [value / 10.0 for value in fields[:JOINTS]],
                 "gripper": fields[JOINTS],
                 "target_rad": list(radians),
+                "host_monotonic": time.monotonic(),
             }
+        telemetry = {
+            "map_source": self.mapping.source,
+            "calibrated": self.calibrated,
+            "frames": self.frames,
+            "dropped": self.dropped,
+            "no_data": self.no_data,
+            "resets": self.resets,
+            "frame": self.last_frame,
+        }
+        if error is not None:
+            telemetry["error"] = error
         self.last_telemetry = telemetry
 
     def feed(self, data):
@@ -157,6 +174,7 @@ class LeaderUartDecoder:
                     continue
                 radians = self._decode(fields)
                 if radians is not None:
+                    self.frames += 1
                     newest = (fields, radians)
             if len(self.buffer) > self.max_frame_bytes:
                 raise ProtocolError("unterminated frame too long")
