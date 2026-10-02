@@ -94,6 +94,18 @@ class ControlTests(unittest.TestCase):
                 Command("target", 2, (0.0, 1.5, 0.0, 0.0, 0.0, 0.0), True), 0.01)
         self.assertIn("J2 +1.500 not in [-1.000, +1.000]", str(caught.exception))
 
+    def test_arming_an_arm_already_outside_the_envelope_is_refused_not_fatal(self):
+        # The arm resting a fraction past its configured range is a real case:
+        # the example envelope is not measured, and one arm sits on it. It has to
+        # come back as a reason -- this is the operator's key path, where an
+        # exception ends the run instead of answering the key.
+        self.arm.positions = (0.0, 0.0, 0.0, 0.0, 0.0, 2.0)
+        self.control.operator_arm(0)
+        self.assertEqual(self.control.state, "STOPPED")
+        self.assertIn("refusing to arm", self.control.reason)
+        self.assertIn("J6 +2.000 not in [-1.000, +1.000]", self.control.reason)
+        self.assertFalse(self.arm.active)
+
     def test_the_arm_s_own_feedback_outside_the_envelope_faults_and_does_not_raise(self):
         # This check runs outside the loop's decoder guard, so raising would
         # leave the state machine by way of main() and take the process with it:

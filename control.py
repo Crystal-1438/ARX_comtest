@@ -85,7 +85,18 @@ class Controller:
             # Read once and hand it on: the veto and the position the arm is
             # started from have to be the same sample, or the check could pass
             # on one reading and the arm be enabled at another.
-            measured = self.limits.check(self.arm.read_joints())
+            measured = vector6(self.arm.read_joints())
+            outside = self.limits.outside(measured)
+            if outside:
+                # Refused in words like any other placement problem, and not
+                # raised: this runs on the operator's key path, outside the
+                # loop's decoder guard, so an exception here leaves by way of
+                # main() and takes the run with it. Not a fault either: the two
+                # ways out -- move the arm, or correct an envelope that does not
+                # fit it -- are both things the operator does while stopped.
+                self.stop("refusing to arm: the arm is outside the configured limits: "
+                          + ", ".join(outside))
+                return
             if self.pre_arm is not None:
                 blocker = self.pre_arm(measured)
                 if blocker:

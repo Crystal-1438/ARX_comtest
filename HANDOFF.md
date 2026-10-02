@@ -420,7 +420,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 279 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 280 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -436,7 +436,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | 整圈锚定与 arm 门禁（离线） | `resolve_turns` 的整圈性质（`turns` 是 360 的整数倍、残差恒在 ±180° 内、残差 ≡ −`shortest_turn` 模一圈，两函数钉在一起防漂移）、30° 边界两侧、跨 `0/360` 的 10° 必须放行（旧判据报 −350°）；`Mapper.anchor` 只在 `ok` 时写 `bias`、`reset()` 连 `bias` 一起清、`bias` 只进 `to_radians` 不污染 `continuous`（标定工具读它）；拒绝信息给"要转多少"与"会走多少"（大小相等，`-residual` 对 `sign * residual`）并列出**所有**不合格关节；解码器 `anchor()` 在首帧离 `reference_deg` 好几百时仍放行、没帧时**返回理由而不是抛**、握手/`reset()`/`ProtocolError` 后清偏置需重新 anchor、没 anchor 过时 `leader.anchor` 是 `null`；`Controller.pre_arm` 的**两条 arm 路都过**（串口帧与本地按键各一条测试）、被拒时 `arm.writes` 为空且 `arm.start` 未被调用、FAULT 下不触发 hook；map 校验 `reference_deg` 的长度/数值/`0..360` 区间（字段保留但不再是门禁）；PTY 端到端：左右同姿态→`a` 进 ACTIVE、偏 90°→`reason` 点名 J3 且 `joints_rad` 全程为 0（机械臂一个目标都没收到）、移回去重按即进 ACTIVE、首帧之前按 `a` 被拒、跨 `0/360` 的 10° 装上 360° 偏置并继续同向跟随 |
 | 状态行打印节流（离线） | `due_for_print` 直接单测：未到间隔不打、到点打、`state` 变立刻打、**`state` 不变而 `reason` 变也立刻打**、同一条不重复打；PTY 里把 `--print-rate` 压到 1 Hz 跑约 2 s，记录数必须仍是"几条"而不是随 100 Hz 控制循环走（**把 `next_print` 改成每轮都到期，这条即以 60+ 条失败**），见第 12.19 节 |
 | `--watch` 单人可读输出（离线） | `watch_line` 直接单测：六个关节的转角与 `+6.1f` 对齐、`out of pose` 点名列出的关节与容差、全部在容差内时写 `in the arm's pose, press a`、没帧时写 `waiting for the leader's first frame` 且**不打 J1**（打 0 会被读成"已经在姿态里"，是唯一错误答案）、ACTIVE/FAULT 只报状态与理由、没有 `distance()` 的解码器也能出一条行；PTY 里 `--watch` 真的打出**行**而不是 JSON（含 `J1`/`J6`、不含 `{`）、`a` 之前写 waiting、按 `a` 后下一行是 `ACTIVE ... armed at measured position`（成功 arm 会变 `state`，这条认不出节流退化；认得出的是 `PrintThrottleTests` 里"`state` 不变而 `reason` 变"那条）。见第 12.20 节 |
-| 限位越界点名（离线） | `Limits.outside()` 逐关节给 `J2 +1.500 not in [-1.000, +1.000]`；串口 target 越界时 `reason` 里点出关节**和**两个限位值；**机械臂实测**越界走 `stop(..., fault=True)` 而**不是抛异常**（`tick` 在解码器 guard 之外，抛出去会穿到 `main()` 直接退出 2、屏上只剩 ERROR）。两条变异：把关节名从消息里拿掉 → 第一条失败；把 `tick` 改回 `self.limits.check(feedback)` → 第二条以 `ProtocolError` 失败。见第 12.21 节 |
+| 限位越界点名（离线） | `Limits.outside()` 逐关节给 `J2 +1.500 not in [-1.000, +1.000]`；**arm 时机械臂本身已在界外 → `refusing to arm: ...` 而不是抛异常**（按键路在解码器 guard 之外，抛出去会退出 2）；串口 target 越界时 `reason` 里点出关节**和**两个限位值；**机械臂实测**越界走 `stop(..., fault=True)` 而**不是抛异常**（`tick` 在解码器 guard 之外，抛出去会穿到 `main()` 直接退出 2、屏上只剩 ERROR）。两条变异：把关节名从消息里拿掉 → 第一条失败；把 `tick` 改回 `self.limits.check(feedback)` → 第二条以 `ProtocolError` 失败。见第 12.21 节 |
 | `fit` 的锚点（离线） | 夹具把 session 的 `continuous_deg` 整体挪一圈（`raw` 不变）后，写出的 map 仍能被新 `Mapper` 从 `raw` 复现出记录的臂角；**把这一行改回 `continuous_deg` 该测试即以 360.0 的差值失败**（三条测试同时失败），见第 12.16 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
@@ -1223,3 +1223,34 @@ README 与 HANDOFF 里的三处措辞按此改写。
 第一批 target 可以直接越界。**这次不是它**——arm 时的 target 是合法的（否则不会等两三秒）。
 要不要补这个检查，取决于限位校准之后还会不会经常贴界：如果是，就该让 arm 前的检查
 一并看见 `--limits`，像现在这样先拒绝、别等撞了再 FAULT（FAULT 会走 SOFT，机械臂下坠）。
+
+### 12.21 附：重标定把上一条缺口坐实了（2026-10-03）
+
+操作者重跑了一次 `session`（单点 + 手输方向，1 个姿态）。两件事：
+
+**（1）新的 map 是对的，旧的不是。** 用采到的那个姿态回代：
+`leader_map.hand.json` 的 J5 偏了 **84.6°**（其余关节 1~5°），新的 `leader_map.json`
+六个关节全 0.0°。J5 的 offset 从 −309.71 变成 **−394.35**（差 84.64°）——
+手输那份的 J5 整圈算错了。这正是当初"手输方向未经复核"的风险兑现，也说明重标定值得。
+方向仍然是 `+ − − − + −`，与手输一致。
+
+**（2）`limits.json` 与这台机械臂不合，现在有实测数字。** 标定姿态下六关节实测对比配置范围：
+
+| | 实测 | 配置范围 | 余量 |
+| --- | --- | --- | --- |
+| J1 | +2.63° | [−179.9, +179.9]° | 177° |
+| J2 | **+0.27°** | [+0.00, +209.1]° | **0.27°** |
+| J3 | **+0.45°** | [+0.00, +179.9]° | **0.45°** |
+| J4 | +5.56° | [−89.95, +89.95]° | 84° |
+| J5 | **−90.15°** | [−89.95, +89.95]° | **已越界 0.19°** |
+| J6 | +3.25° | [−119.8, +119.8]° | 116° |
+
+第 12.21 节那次 FAULT 至此有了确定解释：机械臂静止时就坐在 J2/J3/J5 三个界的边缘上
+（J5 甚至在界外），leader 一动就出界。**这不是映射或锚定的问题，是 `limits.json` 没在
+这台机械臂上量过**（第 9.1 节缺口 1）。
+
+**（3）由此补的一个洞**：arm 那一刻的 `limits.check(measured)` 原本会**抛**。
+按键路不在解码器 `try` 里，抛出去会穿到 `main()` → 打 ERROR、退出 2。也就是说
+**机械臂恰好停在界外时按 `a` 会杀掉进程**——而上面这张表说明这台机械臂现在就是这个状态。
+改成 `refusing to arm: the arm is outside the configured limits: J5 −1.573 not in [...]`，
+与别的"摆位不对"拒绝一致：停在 STOPPED、不锁存、改好再按。
