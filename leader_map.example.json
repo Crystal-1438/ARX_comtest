@@ -1,0 +1,20 @@
+{
+  "comment": [
+    "Copy to leader_map.json next to leader_decoder.py (gitignored) and fill in.",
+    "Per joint: sdk_deg = sign * continuous_deg + offset_deg, then converted to radians.",
+    "sign        rotation direction: 1 or -1.",
+    "offset_deg  leader angle that must map to the vendor zero for this joint.",
+    "unwrap      true if the joint travels more than one full turn.",
+    "calibrated  must be true before app.py will accept --backend sdk.",
+    "Values below are placeholders, not a calibration."
+  ],
+  "calibrated": false,
+  "joints": [
+    {"sign": 1, "offset_deg": 0.0, "unwrap": true},
+    {"sign": 1, "offset_deg": 0.0, "unwrap": true},
+    {"sign": 1, "offset_deg": 0.0, "unwrap": true},
+    {"sign": 1, "offset_deg": 0.0, "unwrap": true},
+    {"sign": 1, "offset_deg": 0.0, "unwrap": true},
+    {"sign": 1, "offset_deg": 0.0, "unwrap": true}
+  ]
+}

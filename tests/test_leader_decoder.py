@@ -1,0 +1,204 @@
+import math
+import unittest
+
+from leader_decoder import HANDSHAKE, LeaderUartDecoder, parse_line
+from leader_map import JointMap, LeaderMap
+from protocol import Command, ProtocolError
+
+
+def calibrated(**overrides):
+    return LeaderMap(joints=(JointMap(**overrides),) * 6, calibrated=True)
+
+
+def feed(decoder, *lines):
+    return decoder.feed(b"".join(line + b"\r\n" for line in lines))
+
+
+VALID = b"795,3281,1060,2353,2875,2085,500"
+
+
+class ParseTests(unittest.TestCase):
+    def test_parses_a_captured_packet(self):
+        self.assertEqual(parse_line(VALID), (795, 3281, 1060, 2353, 2875, 2085, 500))
+
+    def test_drops_everything_that_is_not_exactly_seven_fields(self):
+        for line in (b"0123456789", b"", b"1,2,3,4,5,6", b"1,2,3,4,5,6,7,8",
+                     b"795,3281,1060,2353,2875,2085,", b"795,3281,1060,2353,2875,2085,500,0"):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_line(line))
+
+    def test_rejects_shapes_that_int_would_quietly_accept(self):
+        for line in (b" 795,3281,1060,2353,2875,2085,500",
+                     b"795,3281,1060,2353,2875,2085, 500",
+                     b"+795,3281,1060,2353,2875,2085,500",
+                     b"795,3281,1060,2353,2875,2085,5.0",
+                     b"795,3281,1060,2353,2875,2085,5e2",
+                     b"795,3281,1060,2353,2875,2085,x00"):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_line(line))
+
+    def test_accepts_the_documented_no_data_sentinel(self):
+        self.assertEqual(parse_line(b"-1,3281,1060,2353,2875,2085,500")[0], -1)
+
+
+class DecoderTests(unittest.TestCase):
+    def decoder(self, mapping=None):
+        return LeaderUartDecoder(mapping or calibrated())
+
+    def test_emits_one_target_in_vendor_frame(self):
+        decoder = self.decoder()
+        commands = feed(decoder, VALID)
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertIsInstance(command, Command)
+        self.assertEqual((command.kind, command.deadman), ("target", True))
+        self.assertEqual(len(command.joints), 6)
+        self.assertAlmostEqual(command.joints[0], math.radians(79.5))
+        self.assertAlmostEqual(command.joints[5], math.radians(208.5))
+
+    def test_returns_only_the_newest_frame_of_a_batch(self):
+        decoder = self.decoder()
+        commands = feed(decoder, VALID, b"0,0,0,0,0,0,0")
+        self.assertEqual(len(commands), 1)
+        self.assertAlmostEqual(commands[0].joints[0], 0.0)
+
+    def test_sequence_numbers_strictly_increase(self):
+        decoder = self.decoder()
+        self.assertEqual(feed(decoder, VALID)[0].seq, 1)
+        self.assertEqual(feed(decoder, VALID)[0].seq, 2)
+        # Frames consumed without producing a command must not burn a sequence.
+        self.assertEqual(feed(decoder, HANDSHAKE), [])
+        self.assertEqual(feed(decoder, VALID)[0].seq, 3)
+
+    def test_a_half_written_line_would_corrupt_the_next_one(self):
+        decoder = self.decoder()
+        decoder.feed(VALID[:20])
+        self.assertEqual(decoder.feed(b"0,0,0,0,0,0,0\r\n"), [])
+        self.assertEqual(decoder.dropped, 1)
+
+    def test_reset_discards_that_half_written_line(self):
+        decoder = self.decoder()
+        decoder.feed(VALID[:20])
+        decoder.reset()
+        self.assertEqual(len(decoder.feed(b"0,0,0,0,0,0,0\r\n")), 1)
+        self.assertEqual(decoder.dropped, 0)
+
+    def test_failing_batch_still_publishes_counters_and_a_reason(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        with self.assertRaises(ProtocolError):
+            feed(decoder, HANDSHAKE, b"795,3281,1060,2353,2875,2085,1001")
+        self.assertEqual(decoder.last_telemetry["resets"], 1)
+        self.assertIn("1001", decoder.last_telemetry["error"])
+
+    def test_reassembles_a_frame_split_across_reads(self):
+        decoder = self.decoder()
+        self.assertEqual(decoder.feed(VALID[:20]), [])
+        commands = decoder.feed(VALID[20:] + b"\r\n")
+        self.assertAlmostEqual(commands[0].joints[0], math.radians(79.5))
+
+    def test_a_stalled_stream_emits_nothing_rather_than_repeating_a_target(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        # The controller's watchdog must be free to fire on an idle line.
+        self.assertEqual(decoder.feed(b""), [])
+
+    def test_handshake_is_recognised_rather_than_counted_as_corruption(self):
+        decoder = self.decoder()
+        self.assertEqual(feed(decoder, HANDSHAKE), [])
+        self.assertEqual((decoder.dropped, decoder.resets), (0, 1))
+
+    def test_no_data_sentinel_is_not_zero_degrees(self):
+        decoder = self.decoder()
+        self.assertEqual(feed(decoder, b"-1,3281,1060,2353,2875,2085,500"), [])
+        self.assertEqual(decoder.no_data, 1)
+        self.assertIsNone(decoder.last_telemetry["frame"])
+
+    def test_declares_that_the_wire_carries_no_arm_or_stop(self):
+        self.assertIs(LeaderUartDecoder.provides_arm, False)
+
+    def test_reports_the_map_it_actually_loaded(self):
+        decoder = self.decoder()
+        self.assertTrue(decoder.calibrated)
+        feed(decoder, VALID)
+        self.assertTrue(decoder.last_telemetry["calibrated"])
+        self.assertEqual(decoder.last_telemetry["frame"]["gripper"], 500)
+        self.assertAlmostEqual(decoder.last_telemetry["frame"]["angle_deg"][1], 328.1)
+
+
+class StartupTransientTests(unittest.TestCase):
+    """docs/uart_packet.md section 4: the first packets after a board reset may
+    still read -1 while the encoder waits for its first PWM period."""
+
+    def decoder(self):
+        return LeaderUartDecoder(calibrated())
+
+    def test_no_data_frames_are_dropped_while_the_stream_warms_up(self):
+        decoder = self.decoder()
+        self.assertEqual(feed(decoder, b"-1,-1,-1,-1,-1,-1,500"), [])
+        self.assertEqual(decoder.no_data, 1)
+
+    def test_no_data_after_a_valid_frame_is_a_fault(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        with self.assertRaises(ProtocolError):
+            feed(decoder, b"-1,3281,1060,2353,2875,2085,500")
+
+    def test_a_warmup_drop_does_not_disable_the_later_fault(self):
+        decoder = self.decoder()
+        feed(decoder, b"-1,-1,-1,-1,-1,-1,500")
+        feed(decoder, VALID)
+        with self.assertRaises(ProtocolError):
+            feed(decoder, VALID.replace(b"1060", b"-1"))
+
+    def test_a_replugged_board_warms_up_again_behind_its_handshake(self):
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        self.assertEqual(feed(decoder, HANDSHAKE), [])
+        self.assertEqual(feed(decoder, b"-1,3281,1060,2353,2875,2085,500"), [])
+
+    def test_reset_alone_does_not_silence_a_real_fault(self):
+        # reset() clears buffer state after an upstream error; it must not be
+        # able to reclassify a dead encoder as a startup transient.
+        decoder = self.decoder()
+        feed(decoder, VALID)
+        decoder.reset()
+        with self.assertRaises(ProtocolError):
+            feed(decoder, b"-1,3281,1060,2353,2875,2085,500")
+
+
+class RangeTests(unittest.TestCase):
+    """No checksum: an out-of-range field is the only corruption we can see."""
+
+    def decoder(self):
+        return LeaderUartDecoder(calibrated())
+
+    def reject(self, line):
+        with self.assertRaises(ProtocolError):
+            feed(self.decoder(), line)
+
+    def test_rejects_out_of_range_fields(self):
+        for line in (b"3600,3281,1060,2353,2875,2085,500",
+                     b"-2,3281,1060,2353,2875,2085,500",
+                     b"795,3281,1060,2353,2875,2085,1001",
+                     b"795,3281,1060,2353,2875,2085,-1"):
+            with self.subTest(line=line):
+                self.reject(line)
+
+    def test_a_bad_frame_cannot_hide_behind_a_good_one_in_the_same_batch(self):
+        decoder = self.decoder()
+        with self.assertRaises(ProtocolError):
+            feed(decoder, VALID, b"795,3281,1060,2353,2875,2085,1001")
+        # Nothing was returned, and the buffer is not left half-consumed.
+        self.assertEqual(feed(decoder, VALID)[0].seq, 1)
+
+    def test_rejects_an_overlong_frame(self):
+        self.reject(b"0" * 1100)
+
+    def test_rejects_an_unterminated_overlong_frame(self):
+        with self.assertRaises(ProtocolError):
+            self.decoder().feed(b"0" * 1100)
+
+
+if __name__ == "__main__":
+    unittest.main()
