@@ -6,6 +6,7 @@ per-joint direction and zero that turn those angles into vendor joint
 coordinates live in the mechanism, not in ``docs/uart_packet.md``, so they have
 to be measured.
 
+    session  capture poses interactively, on your own keystrokes
     sample   read the leader (and optionally the arm) at one hand-placed pose
     fit      turn a session of those poses into leader_map.json
 
@@ -21,9 +22,11 @@ state beyond the SOFT mode the vendor constructor already sets.
 """
 
 import argparse
+import collections
 from datetime import date
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -33,15 +36,24 @@ import time
 from app import DEFAULT_SDK, SerialInput
 from leader_decoder import LeaderUartDecoder
 from leader_map import JOINTS, load_mapping, uncalibrated
+from operator_keys import KeyInput
 from protocol import ProtocolError
 
 DEFAULT_SESSION = "calibration_session.jsonl"
+DEFAULT_MAP = "leader_map.json"
+DEFAULT_ARM_LOG = "calibration_arm.log"
+DEFAULT_WINDOW = 1.5
 MIN_POSES = 3
 DEFAULT_MIN_SPAN_DEG = 30.0
 DEFAULT_SLOPE_TOLERANCE = 0.05
 DEFAULT_TOLERANCE_DEG = 3.0
 JITTER_WARN_DEG = 0.5
 MIN_FRAMES = 20
+# A pose within this of the one before it on every joint adds nothing to the fit.
+SAME_POSE_WARN_DEG = 5.0
+# Keys the interactive session acts on. Enter and space both capture, because
+# that is what a hand already on the keyboard reaches for.
+CAPTURE_KEYS = frozenset("c\r\n ")
 
 
 class SamplingDecoder(LeaderUartDecoder):
@@ -234,19 +246,20 @@ def build_map(results, poses, source):
     }
 
 
-def report(results, problems):
-    print("joint   leader span    slope   sign   offset_deg   max residual")
+def report(results, problems, stream=sys.stdout):
+    """Print the per-joint table. ``stream`` is the console, not the SDK log."""
+    print("joint   leader span    slope   sign   offset_deg   max residual", file=stream)
     for index, result in enumerate(results):
         if "error" in result:
             print(f"J{index + 1:<6} {'--':>10}    {'--':>7}   {'--':>4}   "
-                  f"{'--':>10}   {'--':>12}")
+                  f"{'--':>10}   {'--':>12}", file=stream)
         else:
             print(f"J{index + 1:<6} {result['span_deg']:10.2f}    {result['slope']:+.4f}   "
                   f"{int(result['sign']):+d}   {result['offset_deg']:10.3f}   "
-                  f"{result['max_residual_deg']:12.2f}")
+                  f"{result['max_residual_deg']:12.2f}", file=stream)
     for problem in problems:
-        print(f"FAILED  {problem}")
-    sys.stdout.flush()  # Keep the report ahead of the refusal that follows on stderr.
+        print(f"FAILED  {problem}", file=stream)
+    stream.flush()  # Keep the report ahead of the refusal that follows on stderr.
 
 
 def check_map_loads(config):
@@ -330,6 +343,337 @@ def fit(args):
     return 0
 
 
+class VendorChatter:
+    """Keep the vendor SDK's console output out of the operator's display.
+
+    The core library prints from C++ (it announces itself, and its destructor
+    announces the motors it releases), so redirecting ``sys.stdout`` would not
+    catch it: this moves the file descriptors instead. What it wrote is kept in a
+    log rather than discarded, since it is the only trace of what its threads did.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.console_fd = None
+        self.error_fd = None
+        self.console = None
+        self.log = None
+
+    def __enter__(self):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        self.log = open(self.path, "ab")
+        # Two separate duplicates: 1 and 2 are usually the same terminal, but
+        # restoring 2 from the duplicate of 1 would lose a redirected stderr.
+        self.console_fd = os.dup(1)
+        self.error_fd = os.dup(2)
+        self.console = open(self.console_fd, "w", buffering=1, encoding="utf-8")
+        os.dup2(self.log.fileno(), 1)
+        os.dup2(self.log.fileno(), 2)
+        return self.console
+
+    def __exit__(self, *exception):
+        try:
+            self.console.flush()
+        finally:
+            # Restore first, close second: the console object owns console_fd,
+            # and 1 and 2 are our own duplicates by the time they go.
+            os.dup2(self.console_fd, 1)
+            os.dup2(self.error_fd, 2)
+            self.console.close()
+            os.close(self.error_fd)
+            self.log.close()
+        return False
+
+
+class InteractiveSession:
+    """Pose-by-pose capture on the operator's own keystrokes.
+
+    Both sides stay open for the whole session: starting the SDK is expensive,
+    and the operator wants to watch the arm's angles track the leader while they
+    drag it into place. So unlike ``sample``, which opens and closes per pose,
+    this owns a live loop and captures from a trailing window when told to.
+
+    The window is why the captured pose is the one the operator just held: at
+    200 Hz the last ``--window`` seconds are the pose on screen right now.
+    """
+
+    def __init__(self, source, arm, keys, stream, session_path, map_path,
+                 window=DEFAULT_WINDOW, min_span=DEFAULT_MIN_SPAN_DEG,
+                 slope_tolerance=DEFAULT_SLOPE_TOLERANCE,
+                 tolerance=DEFAULT_TOLERANCE_DEG,
+                 clock=time.monotonic, sleep=time.sleep, plain=False):
+        self.source = source
+        self.arm = arm
+        self.keys = keys
+        self.stream = stream
+        self.emit = stream.write
+        self.session_path = session_path
+        self.map_path = map_path
+        self.window = window
+        self.min_span = min_span
+        self.slope_tolerance = slope_tolerance
+        self.tolerance = tolerance
+        self.clock = clock
+        self.sleep = sleep
+        self.plain = plain
+        self.decoder = SamplingDecoder()
+        self.recent = collections.deque()
+        self.poses = []
+        self.errors = 0
+        self.arm_deg = None
+        self.arm_error = None
+        self.drawn = 0
+        self.finished = False
+        self.wrote_map = False
+        self.message = "drag both sides into the same pose, then press c"
+
+    # -- live input ---------------------------------------------------------
+
+    def read_leader(self):
+        """One non-blocking pull from the leader, into the trailing window."""
+        try:
+            data = self.source.read()
+        except ProtocolError:
+            self.errors += 1
+            return
+        if not data:
+            return
+        try:
+            self.decoder.feed(data)
+        except ProtocolError:
+            self.errors += 1
+        # Frames the decoder accepted before a garbled one are still good, so
+        # drain whatever landed either way.
+        for raw, continuous in self.decoder.samples:
+            self.recent.append((self.clock(), raw, continuous))
+        del self.decoder.samples[:]  # The trailing window below is what we keep.
+        cutoff = self.clock() - self.window
+        while self.recent and self.recent[0][0] < cutoff:
+            self.recent.popleft()
+
+    def read_arm(self):
+        if self.arm is None:
+            return
+        try:
+            self.arm_deg = [math.degrees(value) for value in self.arm.read_joints()]
+            self.arm_error = None
+        except Exception as exc:  # The vendor SDK raises its own types.
+            self.arm_deg = None
+            self.arm_error = str(exc)
+
+    def window_pose(self):
+        """The pose on screen right now, from the trailing window."""
+        if not self.recent:
+            return None
+        return summarise([(sample[1], sample[2]) for sample in self.recent],
+                         self.errors, f"pose {len(self.poses) + 1}", self.clock)
+
+    # -- actions ------------------------------------------------------------
+
+    def capture(self):
+        pose = self.window_pose()
+        if pose is None or pose["frames"] < MIN_FRAMES:
+            frames = 0 if pose is None else pose["frames"]
+            self.message = (f"only {frames} leader frame(s) in the last "
+                            f"{self.window:.1f}s -- is the board on?")
+            return False
+        if self.arm is not None:
+            # Fresh at capture time rather than the display's reading: the arm
+            # side of this pose is the measurement, not decoration.
+            self.read_arm()
+            if self.arm_deg is None:
+                self.message = f"could not read the arm: {self.arm_error}"
+                return False
+            pose["arm_deg"] = self.arm_deg
+        self.poses.append(pose)
+        self.errors = 0  # Per-pose: one bad frame early should not taint the rest.
+        self.message = f"captured pose {len(self.poses)}"
+        problems = pose_problems(pose)
+        if problems:
+            self.message += " -- " + "; ".join(problems)
+        elif len(self.poses) > 1:
+            moved = max(abs(now - before) for now, before in
+                        zip(pose["continuous_deg"], self.poses[-2]["continuous_deg"]))
+            if moved < SAME_POSE_WARN_DEG:
+                self.message += " -- nearly the same pose as the last one"
+        return True
+
+    def undo(self):
+        if not self.poses:
+            self.message = "nothing to undo"
+            return
+        self.message = f"dropped pose {len(self.poses)}"
+        self.poses.pop()
+
+    def joints_needing_range(self):
+        """Joints whose captured poses are still too close together to fit."""
+        if len(self.poses) < 2:
+            return list(range(JOINTS))
+        columns = list(zip(*[pose["continuous_deg"] for pose in self.poses]))
+        return [index for index, column in enumerate(columns)
+                if max(column) - min(column) < self.min_span]
+
+    def span_note(self):
+        if not self.poses:
+            return "all six (no poses yet)"
+        needing = self.joints_needing_range()
+        if not needing:
+            return "none -- press f to fit"
+        return " ".join(f"J{index + 1}" for index in needing)
+
+    def save_session(self):
+        """Rewrite the session file from the poses in hand, for a later ``fit``."""
+        if not self.poses or self.session_path is None:
+            return None
+        with open(self.session_path, "w", encoding="utf-8") as stream:
+            for pose in self.poses:
+                stream.write(json.dumps(pose) + "\n")
+        return self.session_path
+
+    def finish(self):
+        """Fit, validate and write the map. False leaves the loop running."""
+        results, problems = fit_session(self.poses, self.min_span, self.slope_tolerance,
+                                        self.tolerance)
+        report(results, problems, stream=self.stream)
+        if problems:
+            if results:
+                self.message = (f"{len(problems)} joint(s) failed -- press u to undo a "
+                                f"pose, or place more of them")
+            else:
+                self.message = f"{problems[0]} -- keep going"
+            self.drawn = 0  # The report scrolled past the display; redraw from the top.
+            return False
+        source = self.save_session() or "<interactive session>"
+        config = build_map(results, self.poses, source)
+        check_map_loads(config)
+        text = json.dumps(config, indent=2)
+        self.emit("\n" + text + "\n\n")
+        if self.map_path is not None:
+            self.map_path.write_text(text + "\n", encoding="utf-8")
+            self.wrote_map = True
+            self.emit(f"wrote {self.map_path}\n")
+            self.emit("Next: start the teleop session with the leader in the reference "
+                      f"pose,\npose 1 ({', '.join(f'{v:.1f}' for v in self.poses[0]['raw_deg'])} "
+                      "raw deg).\n")
+        else:
+            self.emit("\n(no --map given; nothing written)\n")
+        self.finished = True
+        return True
+
+    def handle(self, key):
+        if key in CAPTURE_KEYS:
+            self.capture()
+        elif key == "u":
+            self.undo()
+        elif key == "f":
+            self.finish()
+        elif key == "h":
+            self.message = ("c/enter capture, u undo, f fit and write, q quit; "
+                            "drag the arm by hand -- it stays in SOFT")
+        elif key == "q":
+            self.finished = True
+        elif key in ("\x03", "\x04"):  # Ctrl-C/Ctrl-D if ISIG is ever off.
+            self.finished = True
+
+    # -- display and loop ---------------------------------------------------
+
+    def draw(self):
+        pose = self.window_pose()
+        lines = ["leader calibration -- the arm stays in SOFT, nothing is commanded", ""]
+        lines.append("     leader deg   jitter      arm deg")
+        for index in range(JOINTS):
+            if pose is None:
+                lines.append(f"  J{index + 1}        --       --          --")
+                continue
+            arm_cell = "--" if self.arm_deg is None else f"{self.arm_deg[index]:.2f}"
+            lines.append(f"  J{index + 1} {pose['raw_deg'][index]:9.1f}   "
+                         f"{pose['jitter_deg'][index]:5.2f}   {arm_cell:>9}")
+        frames = 0 if pose is None else pose["frames"]
+        lines.append("")
+        lines.append(f"  {frames} frames, {self.errors} bad   |   poses: {len(self.poses)}"
+                     f"   |   still needing range: {self.span_note()}")
+        lines.append("  [c] capture  [u] undo  [f] fit and write  [q] quit  [h] help")
+        lines.append("  " + self.message)
+        text = "\n".join(lines)
+        if self.plain:
+            self.emit(text + "\n\n")
+            return
+        if self.drawn:
+            self.emit(f"\x1b[{self.drawn}A")  # Back up over the last block.
+        self.emit(text + "\x1b[J\n")
+        self.drawn = len(lines) + 1
+
+    def step(self):
+        self.read_leader()
+        self.read_arm()
+        for key in self.keys.read_keys():
+            self.handle(key)
+        self.draw()
+        self.sleep(0.25)
+
+    def run(self):
+        try:
+            while not self.finished and not self.keys.exhausted:
+                self.step()
+        except KeyboardInterrupt:
+            self.message = "interrupted"
+        finally:
+            if not self.plain and self.drawn:
+                self.emit("\n")
+            # Always leave the poses behind, even when the operator quit early:
+            # re-placing them costs more than re-running fit costs.
+            if self.poses:
+                self.emit(f"\n{len(self.poses)} pose(s) kept in {self.session_path}\n")
+            self.save_session()
+        if self.wrote_map or not self.poses:
+            return 0
+        self.emit(f"no map written: {len(self.poses)} pose(s) are in {self.session_path}, "
+                  f"which 'fit' can use when you are ready\n")
+        return 2
+
+
+def session(args):
+    """Run the interactive capture loop against real hardware."""
+    from backends import VendorArm  # Imported here so the no-arm path never loads the SDK.
+
+    if args.window <= 0:
+        raise ValueError("--window must be positive")
+    keys = KeyInput()
+    try:
+        # Without a terminal the loop would spin until stdin closes and then
+        # report "nothing captured", which reads as a hardware problem.
+        if keys.fd is None or not os.isatty(keys.fd):
+            raise ValueError("stdin is not a terminal; run this from a shell you can "
+                             "type in, or use the 'sample' subcommand instead")
+        # Everything that touches the vendor SDK runs under the redirect: its
+        # constructor and its destructor both print from C++.
+        with VendorChatter(args.arm_log) as console:
+            arm = None
+            if args.arm:
+                if not args.model:
+                    raise ValueError("--arm needs --model to know which URDF to load")
+                console.write(f"starting the vendor SDK; its output goes to "
+                              f"{args.arm_log}\n")
+                arm = VendorArm(args.sdk_root, args.can_port, args.model, "soft")
+            try:
+                source = SerialInput(args.serial, args.baud)
+                try:
+                    live = InteractiveSession(
+                        source=source, arm=arm, keys=keys, stream=console,
+                        session_path=args.out, map_path=args.map, window=args.window,
+                        min_span=args.min_span, slope_tolerance=args.slope_tolerance,
+                        tolerance=args.tolerance, plain=args.plain)
+                    return live.run()
+                finally:
+                    source.close()
+            finally:
+                if arm is not None:
+                    arm.close()
+    finally:
+        keys.close()
+
+
 def load_session(path):
     poses = []
     with open(path, encoding="utf-8") as stream:
@@ -356,6 +700,31 @@ def main(argv=None):
         description="Calibrate the leader encoders against the X5's joint coordinates.")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
+    live = subcommands.add_parser(
+        "session", help="capture poses interactively; you decide when")
+    live.add_argument("--serial", required=True,
+                      help="leader port; use /dev/serial/by-id/, not a ttyACM number")
+    live.add_argument("--baud", type=int, default=115200)
+    live.add_argument("--arm", action="store_true",
+                      help="also read the arm (constructs the vendor SDK, SOFT, read-only)")
+    live.add_argument("--sdk-root", type=Path, default=DEFAULT_SDK)
+    live.add_argument("--can-port", default="can0")
+    live.add_argument("--model", choices=("2023", "2025"))
+    live.add_argument("--out", type=Path, default=Path(DEFAULT_SESSION),
+                      help="where the captured poses are kept")
+    live.add_argument("--map", type=Path, default=Path(DEFAULT_MAP),
+                      help="where a successful fit is written")
+    live.add_argument("--window", type=positive, default=DEFAULT_WINDOW,
+                      help="seconds of leader history one capture covers")
+    live.add_argument("--min-span", type=positive, default=DEFAULT_MIN_SPAN_DEG)
+    live.add_argument("--slope-tolerance", type=positive, default=DEFAULT_SLOPE_TOLERANCE)
+    live.add_argument("--tolerance", type=positive, default=DEFAULT_TOLERANCE_DEG)
+    live.add_argument("--arm-log", type=Path, default=Path(DEFAULT_ARM_LOG),
+                      help="the vendor SDK prints from C++; this is where it goes")
+    live.add_argument("--plain", action="store_true",
+                      help="scroll the readout instead of redrawing it in place")
+    live.set_defaults(handler=session)
+
     sampler = subcommands.add_parser("sample", help="record one hand-placed pose")
     sampler.add_argument("--serial", required=True,
                          help="leader port; use /dev/serial/by-id/, not a ttyACM number")
@@ -366,7 +735,7 @@ def main(argv=None):
     sampler.add_argument("--can-port", default="can0")
     sampler.add_argument("--model", choices=("2023", "2025"))
     sampler.add_argument("--out", type=Path, default=Path(DEFAULT_SESSION))
-    sampler.add_argument("--window", type=positive, default=1.5)
+    sampler.add_argument("--window", type=positive, default=DEFAULT_WINDOW)
     sampler.add_argument("--label")
     sampler.set_defaults(handler=sample)
 
@@ -381,6 +750,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
     except (OSError, ValueError, ProtocolError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

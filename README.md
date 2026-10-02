@@ -15,7 +15,7 @@ ARX_comtest/
 ├── protocol.py            # 可替换的串口帧解析器
 ├── leader_decoder.py      # 外接遥操作器 USART3 文本流解码器
 ├── leader_map.py          # 单圈角度到关节弧度的标定映射
-├── leader_calibrate.py    # 摆姿态采样并拟合出 leader_map.json
+├── leader_calibrate.py    # 交互式摆姿态采样，拟合并写出 leader_map.json
 ├── operator_keys.py       # 本地按键 arm/stop 通道
 ├── limits.example.json    # 关节限制示例
 ├── leader_map.example.json # 遥操作器标定示例
@@ -268,15 +268,40 @@ leader 报的是**单圈绝对角**，没有自己的零点。要变成关节弧
 
 命令是只读的：不 arm、不发目标、不改状态（构造函数自己会进 SOFT）。
 
+推荐用交互模式，**采集时机由你决定**（`scripts/calibrate.sh` 只是 source 好环境的包装）：
+
 ```bash
-# 每个姿态一条。--arm 会在同一进程里只读地取一次手臂角度。
+bash scripts/calibrate.sh session --arm --model 2023 --can-port can0 \
+  --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00
+```
+
+屏幕上实时显示 leader 六个关节的角度、抖动和机械臂当前角度。**用手把两边摆成同一个姿态**，
+扶稳，然后按键：
+
+| 键 | 作用 |
+| --- | --- |
+| `c` 或回车 | 采集当前姿态（取最近 `--window` 秒的中位数） |
+| `u` | 撤销上一条 |
+| `f` | 拟合并写 `leader_map.json`，成功即退出 |
+| `q` | 退出（已采集的姿态留在 `calibration_session.jsonl`，可事后 `fit`） |
+| `h` | 帮助 |
+
+状态行里的 `still needing range` 会点名**哪些关节所有姿态加起来动得还不够**（跨度 < 30°），
+照着把那个关节多摆开一点。`f` 拟合失败不会退出，按提示补姿态再来即可。
+`q` 提前退出时退出码是 2、且不写 map——"采了一半"和"标定完成"能分开。
+
+vendor SDK 会从 C++ 直接打印，这些输出被重定向到 `--arm-log`（默认 `calibration_arm.log`），
+不会打断屏幕上的原地刷新。没有终端时（管道、CI）会直接拒绝，那种场合用下面的 `sample`：
+
+```bash
+# 非交互：每个姿态一条命令。--arm 在同一进程里只读地取一次手臂角度。
 # 第一个姿态是基准姿态，后面必须从它开始。
-.venv/bin/python leader_calibrate.py sample --arm --model 2023 --can-port can0 \
+bash scripts/calibrate.sh sample --arm --model 2023 --can-port can0 \
   --serial /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE8010651-if00 \
   --label "pose A"
 
 # 3 个姿态起，4 个更稳。然后：
-.venv/bin/python leader_calibrate.py fit calibration_session.jsonl --out leader_map.json
+bash scripts/calibrate.sh fit calibration_session.jsonl --out leader_map.json
 ```
 
 - **每个关节都要动**：某个关节在所有姿态里几乎没变，拟合会拒绝它（跨度最小 30°）。

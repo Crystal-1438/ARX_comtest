@@ -68,7 +68,7 @@ bash scripts/install_dependencies.sh --sdk --dry-run
 | `protocol.py` | 临时 JSON 行协议；`Command`、`ProtocolError` 与 `feed(bytes)` 契约 |
 | `leader_decoder.py` | 外接遥操作器 USART3 文本流解码器；见第 6 节末的契约 |
 | `leader_map.py` | 单圈角度 → 关节弧度的标定映射；路径解析的唯一权威 |
-| `leader_calibrate.py` | 标定工具：`sample` 采姿态、`fit` 出映射；见第 6.2 节 |
+| `leader_calibrate.py` | 标定工具：`session` 交互采样、`sample` 单次采样、`fit` 出映射；见第 6.2 节 |
 | `operator_keys.py` | 本地按键 arm/stop 通道（必须叫这个名字，见文件内注释） |
 | `control.py` | STOPPED / ACTIVE / FAULT 状态机、范围检查、限速、超时、跟随误差 |
 | `backends.py` | `MockArm` 与 `VendorArm`；真实 SDK 状态映射、构造/模式切换 |
@@ -79,6 +79,7 @@ bash scripts/install_dependencies.sh --sdk --dry-run
 | `scripts/native/CMakeLists.txt` | 编译厂商两个绑定；相对 RPATH；安装到独立 `.sdk` |
 | `scripts/env.sh` | 必须 source；选择 SDK，设置 ARX_SDK_ROOT、ARX_VENV_DIR、LD_LIBRARY_PATH |
 | `scripts/run.sh` | 从任意工作目录使用指定 venv 执行 app，并原样转发参数 |
+| `scripts/calibrate.sh` | 同上，但执行 `leader_calibrate.py`，参数原样转发 |
 | `tests/` | 控制、解析、SDK 替身、PTY 串口、安装脚本测试 |
 | `vendor/ARX_X5/` | 固定 SDK 快照、许可证、来源说明、SHA256 校验清单 |
 
@@ -192,9 +193,27 @@ decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` �
 
 ### 6.2 标定工具（`leader_calibrate.py`）
 
-`sample` 采一个姿态，`fit` 把若干姿态拟合成 `leader_map.json`。**只读**：不 arm、
+`session` 交互式逐姿态采集（采集时机由操作者按键决定），`sample` 采一个姿态，
+`fit` 把若干姿态拟合成 `leader_map.json`。**只读**：不 arm、
 不发 target；`--arm` 会构造 `InterfacesPy`（厂商线程、构造自己会进 SOFT），
 但只调 `read_joints()`，读完立即 `close()`；不加 `--arm` 则完全不碰 CAN、不加载厂商库。
+
+`session` 与前两者的差别只在生命周期：SDK 起停很贵，操作者又要边摆边看角度，
+所以一个进程里把两侧一直开着，用**最近 `--window` 秒（默认 1.5 s）的滚动窗口**当作"当前姿态"，
+按键才落盘。测试通过注入伪 source/arm/keys/clock 把它变成确定性的（见 `InteractiveTests`）。
+
+- 按键：`c`/回车采集、`u` 撤销、`f` 拟合并写 map（失败不退出，继续补姿态）、
+  `q` 退出、`h` 帮助。`q` 提前退出会把已采姿态写进 `--out` 并以**退出码 2** 结束
+  ——"采了一半"和"标定完成"必须能分开，事后可用 `fit` 接着用。
+- 按键读的是 **原始字符**：为此把 `operator_keys.KeyInput.poll()` 拆成
+  `read_keys()`（原始字符）+ `poll()`（映射成 arm/stop），后者行为不变，
+  现有调用方与测试不受影响。
+- 状态行显示每个还**没动够**的关节（所有姿态跨度 < `--min-span`），直接告诉操作者该摆哪个。
+- 厂商 SDK 从 C++ 直接打印（构造与析构都会），会打乱原地刷新，因此
+  `VendorChatter` 在 fd 层面把 1/2 重定向到 `--arm-log`（默认 `calibration_arm.log`），
+  操作台用 `dup` 出来的那份 fd 重绘。**1 和 2 分别 dup**：从 1 的副本恢复 2 会把
+  被重定向的 stderr 丢掉（这个 bug 已被 `VendorChatterTests` 固定）。
+- stdin 不是终端时直接拒绝（管道/CI 下会空转到 EOF），那种场合用 `sample`。
 
 原理：把机械臂和 leader 用手摆成同一姿态并同时读两边。一个姿态给出 `offset`
 （前提是方向已知），姿态之间的变化给出方向。**第一个采的姿态是基准姿态**，
@@ -248,11 +267,14 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 140 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 163 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
 | 标定工具测试 | 恒等/反向/带偏移、噪声、跨度不足、机械臂未动、非 1:1 斜率、姿态不互洽、跨绕圈点、拒绝写文件、生成的映射能被加载器读回并经 `Mapper` 复现采样到的臂角 |
+| 交互式标定测试 | 注入伪 source/arm/keys/clock：滚动窗口只含当前姿态、撤销、未动够的关节被点名、`f` 失败留在循环里、整圈跑完写出可加载的 map、提前 `q` 以退出码 2 结束且留下的姿态能被 `fit` 直接使用 |
+| `session` 端到端（PTY 终端 + PTY 串口，无 SDK） | 真按键 → 真串口 → 采集 1 个姿态、退出码 2、arm.log 为空（未加载厂商库） |
+| `VendorChatter` fd 重定向 | fd 1/2 都进日志、退出后两个 fd 都回到原目标（分别 dup，不共用副本） |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -283,10 +305,13 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
 4. 支撑机械臂，先用 monitor 验证 SOFT 与六关节读数方向/单位，再校准限位。
    保留外部急停，验证停止/断流的实际行为；不要自动回零或发送示例绝对位置。
 5. leader 解码器已接入（第 6.1 节），标定工具已就绪（第 6.2 节）。
-   **下一步是摆姿态采数据**：`leader_calibrate.py sample --arm` 采 4 个姿态，
-   `fit --out leader_map.json`。用户已确认 leader 与 X5 关节配置相同、连杆长度略有差别，
+   **下一步是摆姿态采数据**：交互式跑
+   `bash scripts/calibrate.sh session --arm --model 2023 --can-port can0 --serial <by-id>`，
+   每个姿态按 `c`，看状态行的 `still needing range` 补关节，够了按 `f` 直接写 `leader_map.json`。
+   用户已确认 leader 与 X5 关节配置相同、连杆长度略有差别，
    所以拟合斜率必须≈±1；不通过就重摆姿态，不要放宽容差。
    门禁会一直挡着实机 teleop，直到 `leader_map.json` 上写了 `"calibrated": true`。
+   **第一个采的姿态是基准姿态**：交互模式已经把它的原始角度写进 map 的 comment。
 6. 标定之后再处理第 9.1 节列出的两个解码器缺口（冻结值、值域内静默错误），
    然后才做低速实机控制，并从 mock 换成 `--backend sdk`。
 7. 如要求真正失能，需厂商提供关闭/失能及失能后读反馈的正式 API/协议，当前不能承诺。
@@ -465,6 +490,19 @@ bash scripts/run.sh --mode teleop --backend mock \
 
 ### 12.9 本节未做
 
-- 实机运动、限位校准、leader 角度标定。
+- 实机运动、限位校准。
 - 移动 leader 以确认编码器跨度（第 12.8 节的未决观察）。
+
+### 12.10 交互式标定（2026-10-02，软件已完成，标定尚未做）
+
+- leader **没动**已确认：第 12.8 节"停在 0.0°"是真实静止，不是冻结编码器。
+- `leader_calibrate.py session` 已实现（第 6.2 节）并全部离线验证：163 项测试通过。
+- leader 真机冒烟：`sample --arm --model 2023 --can-port can0` 在机械臂支起、
+  SOFT 状态下跑通，读回接近零位的六个角度后干净退出；构造与析构期间
+  `InterfacesPy` 的 stdout/stderr 被 `VendorChatter` 收进日志。
+- 全程**没有 arm、没有发 target**。退出日志里的 `DisableMotor` 来自 SDK 析构，
+  不是本工具发出的（与第 12.7 节一致）。
+- `/tmp/leader-smoke.jsonl`、`/tmp/arm-smoke.jsonl` 是冒烟产物，**不是**配对姿态，应丢弃。
+- 真正标定需要操作者用手把 leader 与机械臂摆成同一姿态（机械臂 SOFT 零力矩可拖动，
+  但会因重力下落，**必须已支撑**；现场没有外部急停，全程不要 arm）。
 - 用 `--backend sdk` 试跑 leader teleop：门禁会拦下未标定的映射，这是预期行为。

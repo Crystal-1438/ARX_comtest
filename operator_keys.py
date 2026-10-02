@@ -49,23 +49,32 @@ class KeyInput:
         # existing signal handler instead of arriving as a byte we ignore.
         tty.setcbreak(self.fd)
 
-    def poll(self):
+    def read_keys(self):
+        """Raw characters typed since the last call, oldest first, never blocking.
+
+        Kept separate from the arm/stop mapping because other interactive tools
+        need the characters themselves rather than this module's two actions.
+        """
         if self.fd is None or self.exhausted:
-            return []
+            return ""
         try:
             if not select.select([self.fd], [], [], 0)[0]:
-                return []
+                return ""
             chunk = os.read(self.fd, 64)
         except (BlockingIOError, InterruptedError):
-            return []
+            return ""
         except (OSError, ValueError):
             self.exhausted = True
-            return []
+            return ""
         if not chunk:
             self.exhausted = True  # Closed stdin is not an ongoing source of keys.
-            return []
+            return ""
+        return chunk.decode("utf-8", "replace")
+
+    def poll(self):
+        """poll() -> list[str] of "arm"/"stop", oldest first, never blocking."""
         actions = []
-        for character in chunk.decode("utf-8", "replace"):
+        for character in self.read_keys():
             if character in ARM_KEYS:
                 actions.append("arm")
             elif character in STOP_KEYS:

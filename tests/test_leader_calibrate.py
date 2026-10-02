@@ -1,3 +1,4 @@
+import io
 import json
 import math
 import os
@@ -6,12 +7,14 @@ import pty
 import select
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 from leader_calibrate import (
-    JITTER_WARN_DEG, MIN_POSES, SamplingDecoder, build_map, check_map_loads, collect, fit_joint,
-    fit_session, least_squares, load_session, main, pose_problems, summarise,
-    unwrap_from_reference,
+    JITTER_WARN_DEG, MIN_FRAMES, MIN_POSES, InteractiveSession, SamplingDecoder,
+    VendorChatter, build_map, check_map_loads, collect, fit_joint, fit_session,
+    least_squares, load_session, main, pose_problems, summarise, unwrap_from_reference,
 )
 from leader_map import Mapper, load_mapping
 
@@ -46,6 +49,71 @@ def fit_column(poses, joint, min_span=30.0, tolerance=3.0):
     return fit_joint([pose["continuous_deg"][joint] for pose in poses],
                      [pose["arm_deg"][joint] for pose in poses],
                      min_span, 0.05, tolerance)
+
+
+def payload(pose, count=MIN_FRAMES + 5):
+    """One pose, held, as the board would stream it."""
+    return line(*(int(round(value * 10)) for value in pose), 500) * count
+
+
+class Clock:
+    """A clock the test moves, so the trailing window is deterministic."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class Feeder:
+    """A leader port that hands out one payload per read and advances time."""
+
+    def __init__(self, payloads, clock, step=2.0, on_read=None):
+        self.payloads = list(payloads)
+        self.clock = clock
+        self.step = step
+        self.on_read = on_read
+
+    def read(self):
+        if not self.payloads:
+            return b""
+        self.clock.now += self.step
+        if self.on_read is not None:
+            self.on_read()
+        return self.payloads.pop(0)
+
+
+class FakeArm:
+    """Returns each pose in turn, and advances only when the operator moves on."""
+
+    def __init__(self, poses):
+        self.poses = list(poses)
+        self.index = -1  # Advanced by the leader port: delivering a pose places it.
+        self.error = None
+        self.closed = False
+
+    def advance(self):
+        self.index = min(self.index + 1, len(self.poses) - 1)
+
+    def read_joints(self):
+        if self.error is not None:
+            raise self.error
+        return [math.radians(value) for value in self.poses[max(self.index, 0)]]
+
+    def close(self):
+        self.closed = True
+
+
+class FakeKeys:
+    """A scripted keyboard: one entry per poll, then silence."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.exhausted = False
+
+    def read_keys(self):
+        return self.script.pop(0) if self.script else ""
 
 
 class FitTests(unittest.TestCase):
@@ -286,6 +354,243 @@ class PseudoTerminalTests(unittest.TestCase):
         self.assertEqual(self.drain(), ([], 0))
 
 
+class InteractiveTests(unittest.TestCase):
+    """The capture loop, driven by a scripted keyboard and a clock the test owns."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.stream = io.StringIO()
+
+    def build(self, script=(), payloads=(), arm=None, window=1.0, **kwargs):
+        """A session wired to fakes. Time jumps 2 s per read, so a 1 s window
+        holds exactly the payload just delivered and nothing before it."""
+        self.clock = Clock()
+        live = InteractiveSession(
+            source=Feeder(payloads, self.clock, on_read=None if arm is None else arm.advance),
+            arm=arm, keys=FakeKeys(script), stream=self.stream, window=window,
+            session_path=kwargs.pop("session_path", self.root / "session.jsonl"),
+            map_path=kwargs.pop("map_path", self.root / "leader_map.json"),
+            clock=self.clock, sleep=lambda _: None,
+            plain=kwargs.pop("plain", True), **kwargs)
+        return live
+
+    def test_a_capture_holds_the_pose_on_screen(self):
+        live = self.build(script=["c"], payloads=[payload(LEADER_POSES[0])])
+        live.step()
+        self.assertEqual(len(live.poses), 1)
+        self.assertEqual(live.poses[0]["frames"], MIN_FRAMES + 5)
+        self.assertAlmostEqual(live.poses[0]["raw_deg"][0], 81.7)
+
+    def test_the_arm_side_is_read_at_capture_time(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c"], payloads=[payload(LEADER_POSES[0])], arm=arm)
+        live.step()
+        for recorded, expected in zip(live.poses[0]["arm_deg"], arm_for(LEADER_POSES[0])):
+            self.assertAlmostEqual(recorded, expected)
+
+    def test_the_window_forgets_what_the_operator_has_moved_past(self):
+        live = self.build(script=["c", "c"],
+                          payloads=[payload(LEADER_POSES[0]), payload(LEADER_POSES[1])])
+        live.step()
+        live.step()
+        # The second capture must be the second pose, not a blend of both.
+        self.assertEqual(live.poses[1]["frames"], MIN_FRAMES + 5)
+        self.assertAlmostEqual(live.poses[1]["raw_deg"][0], 140.2)
+
+    def test_a_silent_leader_is_reported_instead_of_captured(self):
+        live = self.build(script=["c"])
+        live.step()
+        self.assertEqual(live.poses, [])
+        self.assertIn("leader frame", live.message)
+
+    def test_an_arm_that_will_not_answer_keeps_the_pose_out(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        arm.error = RuntimeError("can0 is down")
+        live = self.build(script=["c"], payloads=[payload(LEADER_POSES[0])], arm=arm)
+        live.step()
+        self.assertEqual(live.poses, [])
+        self.assertIn("can0 is down", live.message)
+
+    def test_an_operator_still_moving_is_warned_about(self):
+        live = self.build(script=["c"], payloads=[payload(LEADER_POSES[0], 10)
+                                                  + payload(LEADER_POSES[1], 15)])
+        live.step()
+        self.assertEqual(len(live.poses), 1)  # Warned, not refused: the fit decides.
+        self.assertIn("moved", live.message)
+
+    def test_a_pose_repeated_verbatim_is_called_out(self):
+        live = self.build(script=["c", "c"],
+                          payloads=[payload(LEADER_POSES[0]), payload(LEADER_POSES[0])])
+        live.step()
+        live.step()
+        self.assertIn("nearly the same pose", live.message)
+
+    def test_undo_drops_the_pose_just_captured(self):
+        live = self.build(script=["c", "u"], payloads=[payload(LEADER_POSES[0])])
+        live.step()
+        live.step()
+        self.assertEqual(live.poses, [])
+        self.assertIn("dropped pose 1", live.message)
+
+    def test_undo_with_nothing_captured_says_so(self):
+        live = self.build(script=["u"])
+        live.step()
+        self.assertIn("nothing to undo", live.message)
+
+    def test_the_readout_names_the_joints_that_still_need_moving(self):
+        live = self.build()
+        self.assertEqual(live.span_note(), "all six (no poses yet)")
+        live = self.build(script=["c", "c"],
+                          payloads=[payload(LEADER_POSES[0]), payload(LEADER_POSES[1])])
+        live.step()
+        live.step()
+        # Every joint moved well past the minimum span between these two.
+        self.assertEqual(live.span_note(), "none -- press f to fit")
+
+    def test_the_readout_names_joints_that_never_moved(self):
+        live = self.build(script=["c", "c"],
+                          payloads=[payload(LEADER_POSES[0]), payload(LEADER_POSES[0])])
+        live.step()
+        live.step()
+        for number in range(1, 7):
+            self.assertIn(f"J{number}", live.span_note())
+
+    def test_finishing_too_early_leaves_the_loop_running(self):
+        live = self.build(script=["c", "f"], payloads=[payload(LEADER_POSES[0])])
+        live.step()
+        live.step()
+        self.assertFalse(live.finished)
+        self.assertFalse((self.root / "leader_map.json").exists())
+        self.assertIn("pose", live.message)
+
+    def test_finishing_without_an_arm_side_explains_what_is_missing(self):
+        live = self.build(script=["c", "c", "c", "f"],
+                          payloads=[payload(pose) for pose in LEADER_POSES[:3]])
+        for _ in range(4):
+            live.step()
+        self.assertFalse(live.finished)
+        self.assertIn("without arm angles", live.message)
+
+    def test_a_full_run_writes_a_map_the_loader_accepts(self):
+        arm = FakeArm([arm_for(pose) for pose in LEADER_POSES[:3]])
+        live = self.build(script=["c", "c", "c", "f"],
+                          payloads=[payload(pose) for pose in LEADER_POSES[:3]], arm=arm)
+        self.assertEqual(live.run(), 0)
+        mapping = load_mapping(self.root / "leader_map.json")
+        self.assertTrue(mapping.calibrated)
+        for index, offset in enumerate(OFFSETS):
+            self.assertEqual(mapping.joints[index].sign, 1)
+            self.assertAlmostEqual(mapping.joints[index].offset_deg, offset, places=3)
+        # The reference pose has to be recoverable from the map, not just the numbers:
+        # a teleop session that starts anywhere else shifts every target a whole turn.
+        self.assertIn("81.7", (self.root / "leader_map.json").read_text(encoding="utf-8"))
+
+    def test_quitting_partway_keeps_the_poses_and_says_a_map_is_missing(self):
+        arm = FakeArm([arm_for(pose) for pose in LEADER_POSES[:3]])
+        live = self.build(script=["c", "c", "c", "q"],
+                          payloads=[payload(pose) for pose in LEADER_POSES[:3]], arm=arm)
+        self.assertEqual(live.run(), 2)
+        self.assertFalse((self.root / "leader_map.json").exists())
+        poses = load_session(self.root / "session.jsonl")
+        self.assertEqual(len(poses), 3)
+        self.assertEqual(len(poses[0]["arm_deg"]), 6)
+        # What was kept has to be what fit needs, or keeping it was pointless.
+        self.assertEqual(fit_session(poses, 30.0, 0.05, 3.0)[1], [])
+
+    def test_quitting_without_capturing_anything_is_not_a_failure(self):
+        live = self.build(script=["q"])
+        self.assertEqual(live.run(), 0)
+
+    def test_the_live_readout_redraws_in_place(self):
+        live = self.build(script=[], payloads=[payload(LEADER_POSES[0])], plain=False)
+        live.step()
+        live.step()
+        drawn = self.stream.getvalue()
+        self.assertIn("\x1b[", drawn)  # The cursor went back up over the first block.
+        self.assertIn("still needing range", drawn)
+
+    def test_help_lists_the_keys(self):
+        live = self.build(script=["h"])
+        live.step()
+        self.assertIn("capture", live.message)
+
+    def test_the_session_command_captures_from_a_terminal_and_a_port(self):
+        """The whole command: a real pty keyboard, a real pty leader, no SDK."""
+        console_master, console_slave = pty.openpty()
+        leader_master, leader_slave = pty.openpty()
+        for fd in (console_master, console_slave, leader_master, leader_slave):
+            self.addCleanup(os.close, fd)
+        stdin = os.fdopen(os.dup(console_slave), "r")
+        self.addCleanup(stdin.close)
+        # The session draws on the console descriptor it saved, not on sys.stdout,
+        # so quieting the test run means moving fd 1 itself.
+        quiet = os.open(os.devnull, os.O_WRONLY)
+        saved_stdout = os.dup(1)
+        os.dup2(quiet, 1)
+        self.addCleanup(lambda: (os.dup2(saved_stdout, 1), os.close(saved_stdout),
+                                 os.close(quiet)))
+
+        def type_keys():
+            os.write(console_master, b"c")  # Capture, then quit well after it.
+            time.sleep(1.0)
+            os.write(console_master, b"q")
+
+        timer = threading.Timer(0.2, type_keys)
+        self.addCleanup(timer.cancel)
+        timer.start()
+        leader = threading.Timer(0.1, os.write, (leader_master, payload(LEADER_POSES[0])))
+        self.addCleanup(leader.cancel)
+        leader.start()
+        with mock.patch("sys.stdin", stdin):
+            code = main(["session", "--serial", os.ttyname(leader_slave),
+                         "--out", str(self.root / "session.jsonl"),
+                         "--map", str(self.root / "leader_map.json"),
+                         "--arm-log", str(self.root / "arm.log"), "--plain"])
+        # Poses were kept, but with no arm side there is nothing to fit: exit 2.
+        self.assertEqual(code, 2)
+        self.assertFalse((self.root / "leader_map.json").exists())
+        poses = load_session(self.root / "session.jsonl")
+        self.assertEqual(len(poses), 1)
+        self.assertAlmostEqual(poses[0]["raw_deg"][0], 81.7)
+        # Nothing to log: without --arm the vendor library is never loaded.
+        self.assertEqual((self.root / "arm.log").read_bytes(), b"")
+
+
+class VendorChatterTests(unittest.TestCase):
+    """The vendor SDK prints from C++, so fd 1 has to move for real."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.log = Path(directory.name) / "arm.log"
+
+    def test_what_the_sdk_prints_lands_in_the_log_not_on_the_console(self):
+        with VendorChatter(self.log):
+            os.write(1, b"vendor says hello\n")
+            os.write(2, b"vendor says oops\n")
+        written = self.log.read_bytes()
+        self.assertIn(b"vendor says hello", written)
+        self.assertIn(b"vendor says oops", written)
+
+    def test_the_console_descriptors_come_back_unharmed(self):
+        before = os.fstat(1), os.fstat(2)
+        with VendorChatter(self.log):
+            self.assertNotEqual(os.fstat(1).st_ino, before[0].st_ino)
+            self.assertNotEqual(os.fstat(2).st_ino, before[1].st_ino)
+        # Including stderr: it is usually the same terminal, but restoring it
+        # from the descriptor that replaced stdout would lose a redirected one.
+        self.assertEqual(os.fstat(1).st_ino, before[0].st_ino)
+        self.assertEqual(os.fstat(2).st_ino, before[1].st_ino)
+        self.assertEqual(os.fstat(2).st_dev, before[1].st_dev)
+
+    def test_the_console_is_writable_while_redirected(self):
+        with VendorChatter(self.log) as console:
+            console.write("")
+            self.assertTrue(console.writable())
+
+
 class CommandTests(unittest.TestCase):
     """The CLI surface, including the paths that must refuse."""
 
@@ -338,6 +643,11 @@ class CommandTests(unittest.TestCase):
         with open(self.session, "a", encoding="utf-8") as stream:
             stream.write("{not json}\n")
         self.assertEqual(main(["fit", str(self.session)]), 2)
+
+    def test_the_interactive_session_needs_a_terminal(self):
+        # Refused before the port is opened or the SDK is loaded, not after.
+        with mock.patch("sys.stdin", io.StringIO("")):
+            self.assertEqual(main(["session", "--serial", "/dev/null"]), 2)
 
     def test_sample_needs_a_model_before_touching_the_arm(self):
         self.assertEqual(main(["sample", "--serial", "/dev/null", "--arm"]), 2)
