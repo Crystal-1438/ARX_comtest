@@ -445,7 +445,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 304 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 312 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -463,6 +463,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | `--watch` 单人可读输出（离线） | `watch_line` 直接单测：六个关节的转角与 `+6.1f` 对齐、`out of pose` 点名列出的关节与容差、全部在容差内时写 `in the arm's pose, press a`、没帧时写 `waiting for the leader's first frame` 且**不打 J1**（打 0 会被读成"已经在姿态里"，是唯一错误答案）、ACTIVE/FAULT 只报状态与理由（ACTIVE 且有关节被限幅时尾部补 `at the limit: J3 J5`，测试里的假 controller 必须显式给 `saturated`——`Mock` 自动生成的属性为真且不可迭代）、没有 `distance()` 的解码器也能出一条行；PTY 里 `--watch` 真的打出**行**而不是 JSON（含 `J1`/`J6`、不含 `{`）、`a` 之前写 waiting、按 `a` 后下一行是 `ACTIVE ... armed at measured position`（成功 arm 会变 `state`，这条认不出节流退化；认得出的是 `PrintThrottleTests` 里"`state` 不变而 `reason` 变"那条）。见第 12.20 节 |
 | 越界限幅与点名（离线） | 目标越界**不限幅为异常、也不停机**：六个分量各自夹到边界、被夹的关节记进 `saturated`、控制保持 ACTIVE，再发一帧范围内的 target 即恢复（同一个序列继续）；被夹在边界上时机械臂滞后 0.05 rad（在 `max_following_error` 内）走完整拍而不 FAULT——**把 `tick()` 里那条绝对越界检查加回去，这条即以 FAULT 失败**；`stop()` 清空 `saturated`。**机械臂实测**越界仍然拒绝 arm，`Limits.outside()` 逐关节给 `J6 +2.000 not in [-1.000, +1.000]`，走 `refusing to arm: ...` 而**不是抛异常**（按键路在解码器 guard 之外，抛出去会退出 2）；机械臂离指令 2.0 rad 时由 `joint following error` 兜住，是 FAULT 而非异常（`tick` 在 guard 之外，抛出去会穿到 `main()` 退出 2、屏上只剩 ERROR）。见第 12.22 节 |
 | 指令轨迹：跟踪微分器（离线） | `td.py` 是 `ref/adrc.c` 的 `fst`/`TDFunction_independent` 逐项转写，用性质而非重算钉住：远场加速度恒等于 `r`、误差为零且静止时输出为 0、任意误差/速度下 `\|fst\| <= r`、静止时加速度方向与误差相反；六组 r × 五档 dt × 六种步长的**步响应从不越过目标**（这正是"指令不会自己出界"的依据）、最终停在目标上（1e-9）、速度被 `max_speed` 夹住、同一时刻 r 大的关节走得更远；**多圈**：350→370 单调穿过 360（不折回时把误差按 ±180 折一下即失败），700→730 照常收敛；`dt<=0` 原地不动、长度不符抛 `ValueError`。`control.py` 侧：arm 后第一拍就停在实测位置（步长 0 的跳变）、同一目标下一拍位移大于上一拍（还在加速）、全程不越过目标、`td_r_deg` 与 `max_speed` 分别可配置地起作用、多圈 target 穿过 360° 不回摆（`Limits((-10,)*6,(10,)*6)`）、`td_r_deg` 非法（长度、0、负数、字符串）在构造时报 `ValueError`。见第 12.23 节 |
+| 夹爪端点只读测量（离线） | `--mode probe-gripper` 只读第七通道：两段式提示分别记下"完全打开"和"完全闭合"的读数并打印可抄进配置的 JSON；两次读数相同判失败（夹爪没动，或第七通道不是夹爪）、提示处 stdin 到 EOF 也判失败而不是挂住；非 tty 退化成 min/max 连续打印，用 `--duration` 可自动结束；**全程不建 `Controller`、不开串口、不 `start()`、不 `set_catch`、不进状态 3/5**（测试直接断言这几点）；PTY 手动跑通两段式与"读数相同→退出 2"。见第 12.25 节 |
 | 关节增益不可调（离线反汇编） | 三条独立证据：pybind 只导出位置/位姿/夹爪/模式/读取；`k_p`/`k_d` 在整份 DWARF 里**只**作为 `HybridJointCmd` 的字段名存在（控制器成员没有同义名字），且 `statePositionControl()` 里它们来自控制器成员、不是调用参数；`.so` 不引用任何配置文件名、无 `ifstream`/`fopen`，所以增益是二进制内常量。仓库里也没有控制器源码（`CMakeLists.txt:22` 只 `target_link_libraries` 预编译 `.so`）。见第 12.24 节 |
 | `fit` 的锚点（离线） | 夹具把 session 的 `continuous_deg` 整体挪一圈（`raw` 不变）后，写出的 map 仍能被新 `Mapper` 从 `raw` 复现出记录的臂角；**把这一行改回 `continuous_deg` 该测试即以 360.0 的差值失败**（三条测试同时失败），见第 12.16 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |

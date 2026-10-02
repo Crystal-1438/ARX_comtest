@@ -26,6 +26,20 @@ class VendorAdapterTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.arm.write_joints((0.2,) * 6)
 
+    def test_read_gripper_is_the_seventh_channel_alone(self):
+        self.assertEqual(self.arm.read_gripper(), 1.2)
+        self.arm.interface.get_joint_positions.return_value = [0.1] * 6
+        with self.assertRaises(RuntimeError):
+            self.arm.read_gripper()
+        self.arm.interface.get_joint_positions.return_value = [0.1] * 6 + [float("nan")]
+        with self.assertRaises(RuntimeError):
+            self.arm.read_gripper()
+
+    def test_reading_the_gripper_never_sends_anything(self):
+        self.arm.read_gripper()
+        self.assertEqual(self.arm.interface.method_calls[0][0], "get_joint_positions")
+        self.assertEqual(len(self.arm.interface.method_calls), 1)  # No set_catch.
+
     def test_failed_target_does_not_enter_position_mode(self):
         self.arm.interface.set_joint_positions.return_value = False
         with self.assertRaises(RuntimeError):

@@ -1,4 +1,5 @@
 import argparse
+import io
 import json
 import os
 from pathlib import Path
@@ -7,7 +8,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app import (BUNDLED_SDK, check_decoder_for_hardware, decoder_from_path,
-                 due_for_print, install_arm_check, load_limits, run, watch_line)
+                 due_for_print, install_arm_check, load_limits, probe_endpoints,
+                 probe_stream, run, watch_line)
 from backends import MockArm
 from control import Controller, Limits
 from protocol import Command, JsonLineDecoder, ProtocolError
@@ -30,6 +32,78 @@ def limits_file(directory):
     path = Path(directory) / "limits.json"
     path.write_text(json.dumps(LIMITS), encoding="utf-8")
     return path
+
+
+class SpyArm(MockArm):
+    """An arm that hands out scripted gripper readings and records everything."""
+
+    def __init__(self, readings):
+        super().__init__("soft")
+        self.readings = list(readings)
+        self.reads = []
+
+    def read_gripper(self):
+        value = self.readings[0] if len(self.readings) == 1 else self.readings.pop(0)
+        self.reads.append(value)
+        return value
+
+
+class GripperProbeTests(unittest.TestCase):
+    """--mode probe-gripper: reads the gripper channel and commands nothing."""
+
+    def test_the_two_endpoints_are_labelled_and_nothing_is_written(self):
+        arm = SpyArm([1.25, -0.5])
+        stream = io.StringIO()
+        with patch("builtins.input", return_value=""):
+            self.assertEqual(probe_endpoints(arm, stream), 0)
+        text = stream.getvalue()
+        self.assertIn("+1.250000", text)
+        self.assertIn("-0.500000", text)
+        self.assertIn('"open": 1.25', text)
+        self.assertIn('"closed": -0.5', text)
+        self.assertIn("set_catch", text)  # Says which half of it is an assumption.
+        self.assertEqual(arm.writes, [])
+        self.assertFalse(arm.active)
+
+    def test_the_same_reading_twice_is_refused_rather_than_configured(self):
+        arm = SpyArm([3.0, 3.0])
+        stream = io.StringIO()
+        with patch("builtins.input", return_value=""):
+            self.assertEqual(probe_endpoints(arm, stream), 2)
+        self.assertIn("identical", stream.getvalue())
+        self.assertNotIn('"open"', stream.getvalue())
+
+    def test_a_prompt_with_nothing_to_read_gives_up_instead_of_hanging(self):
+        arm = SpyArm([1.0])
+        stream = io.StringIO()
+        with patch("builtins.input", side_effect=EOFError):
+            self.assertEqual(probe_endpoints(arm, stream), 2)
+        self.assertIn("no stdin", stream.getvalue())
+
+    def test_without_a_terminal_it_reports_a_running_range(self):
+        arm = SpyArm([2.0, -1.0, 0.5])
+        stream = io.StringIO()
+        args = arguments(mode="probe-gripper", duration=0.05, print_rate=1000)
+        self.assertEqual(probe_stream(arm, args, stream, lambda: False), 0)
+        text = stream.getvalue()
+        self.assertIn("min -1.000000", text)
+        self.assertIn("max +2.000000", text)
+        self.assertEqual(arm.writes, [])
+        self.assertFalse(arm.active)
+
+    def test_the_mode_never_builds_a_controller_or_opens_the_serial_port(self):
+        source = Mock()
+        with patch("app.Controller") as controller, \
+                patch("app.SerialInput", return_value=source), \
+                patch("sys.stdout", io.StringIO()):
+            self.assertEqual(
+                run(arguments(mode="probe-gripper", duration=0.05, print_rate=1000)), 0)
+        controller.assert_not_called()
+        source.read.assert_not_called()
+
+    def test_hardware_still_needs_a_model(self):
+        with self.assertRaises(ValueError):
+            run(arguments(mode="probe-gripper", backend="sdk", model=None))
 
 
 class AppTests(unittest.TestCase):

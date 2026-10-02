@@ -125,6 +125,122 @@ def preflight(args):
     return 2 if report["errors"] else 0
 
 
+PROBE_OPEN = "Push the gripper jaws to FULLY OPEN by hand, hold them there, then press Enter."
+PROBE_CLOSED = "Now push them to FULLY CLOSED by hand, hold, then press Enter."
+
+
+def _await_enter(stream):
+    """Block for one line on stdin; False when there is no stdin left to read."""
+    try:
+        # No argument: input() writes its prompt to sys.stdout, which is the
+        # vendor's log file while VendorChatter is open. The prompt is printed
+        # to `stream` instead.
+        input()
+    except EOFError:
+        print("no stdin to read a prompt from", file=stream, flush=True)
+        return False
+    return True
+
+
+def probe_endpoints(arm, stream):
+    """Two labelled readings, so open and closed cannot be swapped by accident."""
+    print(PROBE_OPEN, file=stream, flush=True)
+    if not _await_enter(stream):
+        return 2
+    opened = arm.read_gripper()
+    print(f"  held against the open stop:   {opened:+.6f}", file=stream, flush=True)
+    print(PROBE_CLOSED, file=stream, flush=True)
+    if not _await_enter(stream):
+        return 2
+    closed = arm.read_gripper()
+    print(f"  held against the closed stop: {closed:+.6f}", file=stream, flush=True)
+    if opened == closed:
+        print("Both readings are identical, so the jaws did not move between the two "
+              "prompts -- or channel 7 is not the gripper on this SDK. Nothing to "
+              "write down.", file=stream, flush=True)
+        return 2
+    print("Add this to limits.json, then brace the arm before a real session:",
+          file=stream, flush=True)
+    print(json.dumps({"gripper": {"open": opened, "closed": closed}}, indent=2),
+          file=stream, flush=True)
+    print("The endpoints come from the reading above; set_catch is assumed to take "
+          "the same unit, which this cannot confirm.", file=stream, flush=True)
+    return 0
+
+
+def probe_stream(arm, args, stream, stopping):
+    """No terminal: print the channel with a running min and max until stopped."""
+    lowest = highest = None
+    started = time.monotonic()
+    while not stopping():
+        if args.duration and time.monotonic() - started >= args.duration:
+            break
+        value = arm.read_gripper()
+        lowest = value if lowest is None else min(lowest, value)
+        highest = value if highest is None else max(highest, value)
+        print(f"gripper {value:+.6f}   min {lowest:+.6f}   max {highest:+.6f}",
+              file=stream, flush=True)
+        time.sleep(1 / args.print_rate)
+    return 0
+
+
+def probe_gripper(args):
+    """Print the arm's gripper channel, and command nothing at all.
+
+    The two endpoints the teleoperation mapping needs cannot be derived from the
+    SDK: the header gives set_catch no unit, the URDF has no gripper joint, and
+    the implementation stores the value unchecked. So they are measured here --
+    by hand, with the arm held in SOFT (zero torque), which is where
+    constructing the vendor interface leaves it.
+
+    Nothing in this path writes: no Controller is built, no start(), no
+    set_catch, no POSITION_CONTROL and no gravity compensation. That is also why
+    it cannot confirm the one thing the mapping rests on -- that set_catch takes
+    the unit channel 7 reports, which VendorArm.start() merely assumes.
+    """
+    hardware = args.backend == "sdk"
+    if hardware and not args.model:
+        raise ValueError("--model 2023 or 2025 is required for hardware")
+    interactive = sys.stdin.isatty()
+    interrupted = False
+    previous_handlers = {}
+    stream = sys.stdout
+    stack = ExitStack()
+    arm = None
+
+    def request_stop(_signal, _frame):
+        nonlocal interrupted
+        interrupted = True
+
+    try:
+        if not interactive:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.signal(signum, request_stop)
+        if hardware:
+            stream = stack.enter_context(VendorChatter(args.arm_log))
+        arm = (VendorArm(args.sdk_root, args.can_port, args.model, args.stop_mode)
+               if hardware else MockArm(args.stop_mode))
+        print("The arm is in SOFT: zero torque, so it sags. Support it first. "
+              "This mode reads one channel and commands nothing.", file=stream, flush=True)
+        if interactive:
+            return probe_endpoints(arm, stream)
+        return probe_stream(arm, args, stream, lambda: interrupted)
+    except KeyboardInterrupt:
+        # Deliberately left to the default handler on the interactive path: a
+        # Python signal handler would make the blocked input() restart, and Ctrl+C
+        # at a prompt would appear to do nothing.
+        print("interrupted; nothing was commanded", file=stream, flush=True)
+        return 2
+    finally:
+        try:
+            if arm is not None:
+                arm.close()
+        finally:
+            stack.close()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+
+
 def check_decoder_for_hardware(decoder, operator_keys):
     """Refuse to move real motors with a decoder that cannot do the job.
 
@@ -237,6 +353,8 @@ def emit(controller, joints, backend, decoder=None, stream=None):
 def run(args):
     if args.mode == "preflight":
         return preflight(args)
+    if args.mode == "probe-gripper":
+        return probe_gripper(args)
     hardware = args.backend == "sdk"
     if hardware and not args.model:
         raise ValueError("--model 2023 or 2025 is required for hardware")
@@ -356,7 +474,8 @@ def positive(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("monitor", "teleop", "preflight"), default="monitor")
+    parser.add_argument("--mode", choices=("monitor", "teleop", "preflight", "probe-gripper"),
+                        default="monitor")
     parser.add_argument("--backend", choices=("mock", "sdk"), default="mock")
     parser.add_argument("--stop-mode", choices=("soft", "disabled"), default="soft",
                         help="SOFT is zero torque, not motor disable; SDK disabled mode is unsupported")

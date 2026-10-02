@@ -9,7 +9,7 @@ SDK 状态映射、验证记录、未完成事项和下一步操作；[AGENTS.md
 
 ```text
 ARX_comtest/
-├── app.py                 # 运行入口：monitor / teleop / preflight
+├── app.py                 # 运行入口：monitor / teleop / preflight / probe-gripper
 ├── backends.py            # SDK 与模拟机械臂
 ├── control.py             # 状态机、限速及超时处理
 ├── protocol.py            # 可替换的串口帧解析器
@@ -173,6 +173,28 @@ bash scripts/run.sh --backend sdk --mode monitor --model 2023 --can-port can0
 启动进入 SOFT；按 10 Hz 输出 JSON，包含 `joints_rad`、`joints_deg`、状态及原因。
 可用 `--print-rate 5` 调整输出频率。读取 SDK 返回的前六个关节，第七通道是夹爪。
 `host_read_monotonic` 是本机读取时刻，不是电机反馈时间戳。
+
+### 测量夹爪的第七通道
+
+夹爪在 `set_catch()` 里"完全打开/完全闭合"各是什么数值，**本仓库里查不到**：SDK 头文件不给单位，
+URDF 里没有夹爪关节，实现里连范围检查都没有。所以只能实测，`--mode probe-gripper` 就是干这个的。
+它**只读第七通道**：不建 `Controller`、不 arm、不进位置控制或重力补偿、不发任何指令。
+
+```bash
+bash scripts/run.sh --backend sdk --mode probe-gripper --model 2023 --can-port can0
+```
+
+这一路进的是 SOFT，**零力矩、机械臂会下坠**：先把臂支撑好。工具分两次提示——先把夹爪手推到
+**完全打开**并保持、回车，再推到**完全闭合**、回车，然后打印两个带标签的读数。两次相同会被判为
+失败（说明夹爪没动，或第七通道根本不是夹爪），退出码 `2`。终端不是 tty 时退化成连续打印并在退出时
+给出 min/max，可以用 `--duration` 限定时长：
+
+```bash
+python3 app.py --mode probe-gripper --backend mock --duration 3
+```
+
+工具**只打印，不写任何文件**。它测的也只是"读"这一半：`set_catch()` 是否吃同一个数值单位，
+是从 `VendorArm.start()` 沿用下来的假设，这个工具证明不了。
 
 ## 串口正常控制
 

@@ -70,6 +70,7 @@ class MockArm:
     def __init__(self, stop_mode="disabled"):
         self.stop_mode = stop_mode
         self.positions = (0.0,) * 6
+        self.gripper = 0.0
         self.active = False
         self.writes = []
 
@@ -82,6 +83,9 @@ class MockArm:
 
     def read_joints(self):
         return self.positions
+
+    def read_gripper(self):
+        return self.gripper
 
     def write_joints(self, positions):
         if not self.active:
@@ -190,6 +194,22 @@ class VendorArm:
             raise RuntimeError("SDK returned unexpected joint count")
         # Seventh channel is the gripper, not joint7. This app controls six arm joints.
         return vector6(values[:6])
+
+    def read_gripper(self):
+        """The seventh channel on its own: the gripper, in whatever unit it uses.
+
+        Read-only and used by exactly one caller, ``app.py --mode probe-gripper``,
+        because that unit is not written down anywhere -- not in the header, not
+        in the URDF, and not in the binary. ``start()`` already assumes the value
+        it reads here is also what ``set_catch`` will accept; this measures the
+        reading half of that assumption and cannot confirm the other half.
+        """
+        values = list(self.interface.get_joint_positions())
+        if len(values) != 7:
+            raise RuntimeError("SDK must report six joints plus gripper")
+        if not math.isfinite(values[6]):
+            raise RuntimeError("Invalid gripper feedback")
+        return float(values[6])
 
     def start(self, positions):
         # POSITION_CONTROL also runs the vendor gripper controller. Preserve its pose.
