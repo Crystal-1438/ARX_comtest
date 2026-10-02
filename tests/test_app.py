@@ -129,10 +129,16 @@ class HardwareGateTests(unittest.TestCase):
             check_decoder_for_hardware(decoder, operator_keys=True)
 
     def test_run_refuses_before_any_motor_is_constructed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # The map is named outright rather than left to the decoder's default:
+        # that default is ./leader_map.json, so a real calibration sitting in the
+        # working directory would let this through and reach for the serial port.
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
             with self.assertRaises(ValueError):
-                run(arguments(backend="sdk", model="2023", decoder=str(PROJECT / "leader_decoder.py"),
-                              limits=limits_file(directory), operator_keys=True))
+                run(arguments(backend="sdk", model="2023",
+                              decoder=str(PROJECT / "leader_decoder.py"),
+                              limits=limits_file(directory),
+                              leader_map=self.write(directory, calibrated=False),
+                              operator_keys=True))
 
     def test_mock_teleop_still_accepts_an_uncalibrated_decoder(self):
         # Watching a live stream is exactly what the uncalibrated mapping is for.

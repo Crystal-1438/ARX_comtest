@@ -132,6 +132,24 @@ sha256sum -c SHA256SUMS
 但 `set_arm_status` 已绑定，`.rodata:0x32040` 的跳转表把它映射到 `stateGravityCompensation`，
 厂商自己的 `bimanual/script/single_arm.py:117` 用的也是 `set_arm_status(3)`。
 
+上表的编号在**源码级**也一致：`InterfacesThread.hpp` 的 `enum state { SOFT, GO_HOME, PROTECT,
+G_COMPENSATION, END_CONTROL, POSITION_CONTROL }`（顺序即取值），`ControllerBase` 里
+`stateSoft/stateGoHome/stateProtect/stateGravityCompensation/stateEndControl/statePositionControl`
+六个符号都实际存在。两点补充证据（2026-10-03 在 `.sdk` 的 `.so` 上反汇编）：
+
+- `ControllerBase::Init()` 调用 `setEnableMotor()` —— **构造 `InterfacesPy` 就会使能电机**，
+  这正是 AGENTS.md 要求"导入类做内省 ≠ 构造 `InterfacesPy`"的原因，现在有二进制证据。
+- `ControllerBase::stateSoft()` 把一片力/前馈目标清零后跳到 `CatchSoft()`，**不发任何失能报文**；
+  这坐实了"SOFT 是零力矩、不是失能"的区分。
+
+**退出时的关停序列**（`InterfacesPy` 析构，实测日志）：`ControllerThread::ArmThread()` 打印
+`[ArmThread] DisableMotor` → `ControllerBase::destoryFunc()`（它只把 SocketCAN 的两个回调
+清空，本身不装失能帧）→ `[ArmThread] finish close` → `ControllerThread::~ControllerThread()`
+打印 `[Controller] waiting for thread finish` / `[Controller] thread finish`（等线程退出）→
+`SocketCan::impl::~impl()` 打印 `Destroying SocketCAN adapter...` 并 `Close()` 掉套接字。
+**CAN 套接字一关，本进程就不会再发出任何指令**；`DisableMotor` 这个标签属于厂商的关停路径，
+但"驱动器是否真的因此失去力矩"没有实测，不能当已验证结论。见 §12.13。
+
 ## 6. 串口契约与状态机
 
 当前协议仅用于测试，不是用户最终控制器协议。UTF-8 JSON 行、默认 115200 / 8N1：
@@ -320,7 +338,8 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | `VendorChatter` fd 重定向 | fd 1/2 都进日志、退出后两个 fd 都回到原目标（分别 dup，不共用副本） |
 | 重力补偿接线（离线，无硬件） | `set_arm_status(3)` 恰好一次、跟踪目标时拒绝切模式、`close()` 后最后一条是 SOFT；`--arm` 的构造→进 3→读→`close()` 顺序；`confirm_release` 确认才 `stop()`、stdin 关闭也回 SOFT；**中断路径不进确认提示但 `close()` 仍执行** |
 | SIGTERM 处理 | 真给自己发 SIGTERM：变成 `KeyboardInterrupt`（若未安装处理器，测试进程会被直接杀掉，不会静默通过）；处理前后 `SIGTERM` 处理器被恢复 |
-| 重力补偿真机 | **未验证**：2026-10-03 操作者跑起过一次 `session --arm` 并报"正确启动"（无报错），但托住/下沉/漂移的表现没有反馈（见第 12.11 节末） |
+| 重力补偿真机 | **未验证**：2026-10-03 操作者跑完过一次 `session --arm`（采到 1 个 301 帧、0 坏帧的姿态，见第 12.14 节），但"是否真的托住"没有观测记录——当时机械臂停在零位附近，分不清是重力补偿托着还是本来就架在支撑上 |
+| 真机标定产物 | 已生成 `leader_map.json`（方向 `+ − − − + −`，手输，**未经第二姿态复核**），见第 12.14 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -603,3 +622,84 @@ bash scripts/run.sh --mode teleop --backend mock \
   （曾写成"两边都为正才算一致"，会把所有反向移动的关节误报为矛盾）。
 - **单点路径与 `fit` 的取舍**：`fit` 由数据自证但要多摆几次；单点快，但**没有任何数据能反驳
   手打的符号**，复核是唯一的保护。这一点同时写进了 README 的标定一节和生成文件的注释。
+
+### 12.13 一次真机退出日志的判读，与一处 SDK 版本疑点（2026-10-03）
+
+操作者在 Robot PC 上跑完一次标定后贴来了 SDK 的关停输出：
+
+```
+DisableMotor
+[Controller] waiting for thread finish
+[ArmThread] DisableMotor
+[Controller] waiting for thread finish
+[Controller] waiting for thread finish
+[ArmThread] finish close
+[Controller] thread finish
+DisableMotor
+Destroying SocketCAN adapter...
+Waiting for receiver thread to terminate.
+terminate_receiver_thread_ is true
+waitting receiver_thread close
+ReciveThread finish
+receiver_thread_running_.load()
+return
+CAN socket destroyed.
+finish
+```
+
+判读：**这是正常关停，不是报错。** 逐行对应到本机 `.sdk` 的二进制（每个字符串的出处都用
+反汇编定位过，见第 5 节）：`[ArmThread] DisableMotor` 与 `[ArmThread] finish close` 来自
+`ControllerThread::ArmThread()` 的收尾；`[Controller] waiting for thread finish` 与
+`[Controller] thread finish` 来自 `ControllerThread::~ControllerThread()`；`Destroying SocketCAN
+adapter... / CAN socket destroyed. / finish` 来自 `SocketCan::impl::~impl()`；`ReciveThread finish`
+来自 `SocketCan::impl::ReciveThreadWrapper()`。**没有一行是异常路径。**
+
+**疑点（要查，别忽略）**：这份日志有两处字符串与 pinned 快照/本机 `.sdk` **对不上**：
+
+| 日志里 | 本机所有副本里 |
+| --- | --- |
+| `DisableMotor`（两处，无前缀） | 只有 `[ArmThread] DisableMotor`，没有裸标签（已对仓库内每个 `.so` 逐字符串搜过） |
+| `[Controller] thread finish` | `@[Controller] thread finish`（多一个 `@`） |
+
+同一份源码编译出来不应该差这两个字符，所以最可能的解释是 **Robot PC 上加载的
+`libarx_x5_src.so` 与本仓库 pin 的这份不是同一次构建**（可能是更早的 checkout，或系统里另装了一份）。
+这件事要紧，因为第 5 节状态编号（尤其 `set_arm_status(3)` = 重力补偿）是从**本机**二进制推出来的。
+下一步在 Robot PC 上做两件事即可确认：
+
+```bash
+sha256sum .sdk/bimanual/api/arx_x5_src/libarx_x5_src.so   # 与本机比
+strings .sdk/bimanual/api/arx_x5_src/libarx_x5_src.so | grep "thread finish"
+```
+
+若哈希不同，就在**那台机器**上重做一次第 5 节的核对（`nm -DC` 找
+`stateGravityCompensation`、`InterfacesThread.hpp` 的枚举），再谈真机标定。
+
+### 12.14 第一次真机标定的产物：做出了 map，但**没做复核**（2026-10-03 00:17）
+
+同一次运行在仓库根目录留下了三个（已被 `.gitignore` 忽略的）产物，是真机产物，别当垃圾删：
+
+| 文件 | 内容 |
+| --- | --- |
+| `calibration_session.jsonl` | 1 个姿态，301 帧，0 坏帧，jitter ≤1.0° —— 采集本身干净 |
+| `leader_map.json` | `calibrated: true`，六个方向为 `+ − − − + −`，均为手输 |
+| `calibration_arm.log` | 115 KB 厂商 C++ 输出（正常关停序列见 §12.13） |
+
+参考姿态：leader raw `75.5, 322.8, 96.4, 258.0, 309.7, 218.4`，
+arm `-0.08, 0.34, 0.60, 1.39, -0.01, 0.45` 度 —— **六轴全在 1.4° 以内**，
+即操作者把"基准姿态"取成了机械臂的零位姿态，于是 `offset_deg ≈ -sign * raw_deg`。
+这本身没问题（基准姿态可以任选），但它意味着这个 map **只在零位姿态附近被测过**。
+
+**要紧的一点：这次没有用第二姿态复核**（session 里只有 1 个姿态，文件注释也是
+`HAND_ENTERED_EVIDENCE`）。方向是人打的，而**打错不会失败得很安全**：map 在基准姿态上
+仍然完全正确，只在离开基准姿态后镜像。所以在拿它跑实机 teleop 之前，建议重跑一次
+`session --arm`：把 leader 摆回同一基准姿态按 `c`，再明显挪到另一个姿态按 `c` 复核——
+复核通过再信这份 map（重跑得到的 map 应当与此文件一致）。
+
+另注：`leader_map.json` 就在仓库根目录，所以**在这个目录里，硬件 teleop 的门禁已经被打开**
+（`--backend sdk --mode teleop` 不会再因"未标定"被拦）。这是文件本身的作用，不是 bug，
+但别在不打算驱动机械臂的时候把它留在手边。
+
+顺带修掉一处被这份文件暴露出来的测试脆弱性：`test_run_refuses_before_any_motor_is_constructed`
+原先依赖**工作目录里没有 `leader_map.json`**（解码器的默认路径就是 `./leader_map.json`），
+真机标定一做，这个门禁测试就会转而尝试打开串口并以 `SerialException` 失败。
+现在它显式指定一份未标定的 map 并用 `patch.dict(os.environ)` 隔离环境，与 cwd 无关。
