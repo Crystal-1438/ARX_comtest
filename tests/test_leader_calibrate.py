@@ -15,8 +15,9 @@ from unittest import mock
 from leader_calibrate import (
     JITTER_WARN_DEG, MIN_FRAMES, MIN_POSES, InteractiveSession, SamplingDecoder,
     VendorChatter, build_map, check_map_loads, collect, confirm_release, fit_joint,
-    fit_session, least_squares, load_session, main, pose_problems, summarise,
-    treat_sigterm_as_interrupt, unwrap_from_reference,
+    fit_session, fitted_evidence, fitted_joints, least_squares, load_session, main,
+    pose_problems, shortest_delta, single_point_map, summarise,
+    treat_sigterm_as_interrupt, unwrap_from_reference, verify_directions,
 )
 from leader_map import Mapper, load_mapping
 
@@ -45,6 +46,12 @@ def session(leader_poses=LEADER_POSES):
     """A session as sample() would have written it."""
     return [{"raw_deg": list(leader), "continuous_deg": list(leader),
              "arm_deg": arm_for(leader)} for leader in leader_poses]
+
+
+def fitted_map(poses, results):
+    """The map body a successful fit of these poses produces."""
+    return build_map(fitted_joints(results), poses, "session.jsonl",
+                     fitted_evidence(results))
 
 
 def fit_column(poses, joint, min_span=30.0, tolerance=3.0):
@@ -245,7 +252,7 @@ class SessionTests(unittest.TestCase):
         poses = session()
         results, problems = fit_session(poses, 30.0, 0.05, 3.0)
         self.assertEqual(problems, [])
-        mapping = check_map_loads(build_map(results, poses, "session.jsonl"))
+        mapping = check_map_loads(fitted_map(poses, results))
         self.assertTrue(mapping.calibrated)
         self.assertEqual([joint.sign for joint in mapping.joints], [1.0] * 6)
         for joint, offset in zip(mapping.joints, OFFSETS):
@@ -256,7 +263,7 @@ class SessionTests(unittest.TestCase):
         # mapper and land on the arm angles that were recorded beside them.
         poses = session()
         results, _ = fit_session(poses, 30.0, 0.05, 3.0)
-        mapper = Mapper(check_map_loads(build_map(results, poses, "session.jsonl")))
+        mapper = Mapper(check_map_loads(fitted_map(poses, results)))
         for pose in poses:
             radians = mapper.to_radians(pose["raw_deg"])
             for produced, expected in zip(radians, pose["arm_deg"]):
@@ -274,7 +281,7 @@ class SessionTests(unittest.TestCase):
                  for pose in continuous]
         results, problems = fit_session(poses, 30.0, 0.05, 3.0)
         self.assertEqual(problems, [])
-        mapper = Mapper(check_map_loads(build_map(results, poses, "session.jsonl")))
+        mapper = Mapper(check_map_loads(fitted_map(poses, results)))
         for pose in poses:
             radians = mapper.to_radians(pose["raw_deg"])
             for produced, expected in zip(radians, pose["arm_deg"]):
@@ -356,6 +363,76 @@ class PseudoTerminalTests(unittest.TestCase):
         self.assertEqual(self.drain(), ([], 0))
 
 
+class DirectionTests(unittest.TestCase):
+    """One pose plus the directions the operator typed, with no fit to appeal to."""
+
+    def test_a_single_pose_and_a_sign_pin_the_offset_exactly(self):
+        pose = session([LEADER_POSES[0]])[0]
+        signs = [1, -1, 1, 1, -1, 1]
+        for index, (joint, sign) in enumerate(zip(single_point_map(pose, signs), signs)):
+            self.assertEqual(joint["sign"], sign)
+            # arm = sign * raw + offset, so this must reproduce the arm angle.
+            self.assertAlmostEqual(sign * pose["raw_deg"][index] + joint["offset_deg"],
+                                   pose["arm_deg"][index])
+
+    def test_the_offset_is_not_folded_into_half_a_turn(self):
+        # The number means literally arm_deg - sign * raw_deg; a joint placed at
+        # 359.9 against a raw of 0.2 has an offset of 359.7, not -0.3, and that
+        # is what the file has to say for the same-pose reference to hold.
+        pose = {"raw_deg": [0.2] * 6, "arm_deg": [359.9] * 6}
+        joint = single_point_map(pose, [1] * 6)[0]
+        self.assertAlmostEqual(joint["offset_deg"], 359.7)
+
+    def test_shortest_delta_wraps_the_short_way_round(self):
+        self.assertAlmostEqual(shortest_delta(1.0, 359.0), 2.0)
+        self.assertAlmostEqual(shortest_delta(359.0, 1.0), -2.0)
+        self.assertAlmostEqual(shortest_delta(181.0, 0.0), -179.0)
+
+    def test_a_matching_direction_is_agreed_with_whichever_way_it_moved(self):
+        # Some joints of the reference pair move backwards; sign +1 still means
+        # "together", so the check must not be fooled by the step's own sign.
+        reference = session([LEADER_POSES[0]])[0]
+        second = session([LEADER_POSES[1]])[0]
+        self.assertTrue(any(delta < 0 for delta in (
+            second["raw_deg"][index] - reference["raw_deg"][index]
+            for index in range(6))))
+        agreed, contradicted, unmoved = verify_directions(reference, second, [1] * 6)
+        self.assertEqual(agreed, list(range(6)))
+        self.assertEqual((contradicted, unmoved), ([], []))
+
+    def test_the_opposite_direction_is_contradicted(self):
+        reference = session([LEADER_POSES[0]])[0]
+        second = session([LEADER_POSES[1]])[0]
+        agreed, contradicted, unmoved = verify_directions(reference, second,
+                                                          [-1, -1, 1, 1, 1, 1])
+        self.assertEqual(agreed, [2, 3, 4, 5])
+        self.assertEqual(contradicted, [0, 1])
+        self.assertEqual(unmoved, [])
+
+    def test_a_joint_that_did_not_move_is_reported_as_unchecked(self):
+        # The other joints moved, so the directions are still worth writing -- but
+        # the one that stayed put is named rather than counted as verified.
+        reference = session([LEADER_POSES[0]])[0]
+        second = session([LEADER_POSES[1]])[0]
+        second["raw_deg"][4] = reference["raw_deg"][4]  # J5 never moved.
+        second["arm_deg"][4] = reference["arm_deg"][4]
+        agreed, contradicted, unmoved = verify_directions(reference, second, [1] * 6)
+        self.assertEqual(unmoved, [4])
+        self.assertEqual(contradicted, [])
+        self.assertEqual(len(agreed), 5)
+
+    def test_a_tiny_arm_step_is_unchecked_even_when_the_leader_moved(self):
+        # The leader moved well past the threshold but the arm barely did; that
+        # says nothing about the direction either way.
+        reference = session([LEADER_POSES[0]])[0]
+        second = session([LEADER_POSES[1]])[0]
+        second["arm_deg"][0] = reference["arm_deg"][0] + 1.0
+        agreed, contradicted, unmoved = verify_directions(reference, second, [1] * 6)
+        self.assertNotIn(0, agreed)
+        self.assertNotIn(0, contradicted)
+        self.assertIn(0, unmoved)
+
+
 class InteractiveTests(unittest.TestCase):
     """The capture loop, driven by a scripted keyboard and a clock the test owns."""
 
@@ -377,6 +454,21 @@ class InteractiveTests(unittest.TestCase):
             clock=self.clock, sleep=lambda _: None,
             plain=kwargs.pop("plain", True), **kwargs)
         return live
+
+    def play(self, live):
+        """One step per scripted keystroke, so a test counts keys, not steps."""
+        for _ in range(len(live.keys.script)):
+            live.step()
+        return live
+
+    def held(self, reference, then, keys):
+        """Payloads for a ``keys``-long script: the reference pose once, then the
+        pose the operator moves on to, still streaming for every later read.
+
+        Without the trailing copies the port goes quiet and the fake clock stops,
+        so the trailing window would freeze on old frames instead of showing what
+        is happening now."""
+        return [payload(reference)] + [payload(then)] * (len(keys) - 1)
 
     def test_a_capture_holds_the_pose_on_screen(self):
         live = self.build(script=["c"], payloads=[payload(LEADER_POSES[0])])
@@ -448,8 +540,9 @@ class InteractiveTests(unittest.TestCase):
                           payloads=[payload(LEADER_POSES[0]), payload(LEADER_POSES[1])])
         live.step()
         live.step()
-        # Every joint moved well past the minimum span between these two.
-        self.assertEqual(live.span_note(), "none -- press f to fit")
+        # Every joint moved well past the minimum span between these two. The
+        # "press f" nudge lives in the key line now, not in the status field.
+        self.assertEqual(live.span_note(), "none")
 
     def test_the_readout_names_joints_that_never_moved(self):
         live = self.build(script=["c", "c"],
@@ -517,6 +610,160 @@ class InteractiveTests(unittest.TestCase):
         live = self.build(script=["h"])
         live.step()
         self.assertIn("capture", live.message)
+
+    # -- one pose plus the operator's own directions -------------------------
+
+    def test_directions_write_a_map_from_a_single_pose(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c", "d", "+", "-", "+", "+", "-", "+", "\r"],
+                          payloads=[payload(LEADER_POSES[0])], arm=arm)
+        self.play(live)
+        self.assertTrue(live.wrote_map)
+        mapping = load_mapping(live.map_path)
+        self.assertTrue(mapping.calibrated)
+        # This path has nothing to argue with: the answers land as given, which is
+        # why one of them being wrong has to be caught by the operator instead.
+        self.assertEqual([joint.sign for joint in mapping.joints],
+                         [1.0, -1.0, 1.0, 1.0, -1.0, 1.0])
+
+    def test_the_single_pose_map_reproduces_the_pose_it_came_from(self):
+        # The point of the method: with the direction known, one pose pins the
+        # offset exactly, so the mapper must return the arm's own angles.
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c", "d", "+", "+", "+", "+", "+", "+", "\r"],
+                          payloads=[payload(LEADER_POSES[0])], arm=arm)
+        self.play(live)
+        mapper = Mapper(load_mapping(live.map_path))
+        produced = mapper.to_radians(load_session(live.session_path)[0]["raw_deg"])
+        for value, expected in zip(produced, arm_for(LEADER_POSES[0])):
+            self.assertAlmostEqual(math.degrees(value), expected, places=3)
+
+    def test_a_hand_entered_direction_beats_the_pose_a_fit_would_have_found(self):
+        # Typing - for a joint keeps the offset exact at the reference pose but
+        # mirrors every movement away from it. Nothing in this path objects, so
+        # the file has to carry the warning instead.
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c", "d", "-", "+", "+", "+", "+", "+", "\r"],
+                          payloads=[payload(LEADER_POSES[0])], arm=arm)
+        self.play(live)
+        mapping = load_mapping(live.map_path)
+        self.assertEqual(mapping.joints[0].sign, -1.0)
+        reference = load_session(live.session_path)[0]["raw_deg"]
+        mapper = Mapper(mapping)
+        produced = mapper.to_radians(reference)
+        self.assertAlmostEqual(math.degrees(produced[0]), arm_for(LEADER_POSES[0])[0],
+                               places=3)
+        # Away from the reference the mirrored joint disagrees with the arm.
+        moved = list(reference)
+        moved[0] = (moved[0] + 20.0) % 360.0
+        self.assertNotAlmostEqual(math.degrees(mapper.to_radians(moved)[0]),
+                                  arm_for(LEADER_POSES[0])[0] + 20.0, places=1)
+        self.assertIn("re-check the signs", live.map_path.read_text(encoding="utf-8"))
+
+    def test_directions_need_a_pose_first(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["d"], arm=arm)
+        live.step()
+        self.assertIn("capture the reference pose first", live.message)
+        self.assertIsNone(live.awaiting)
+
+    def test_directions_without_an_arm_say_so(self):
+        live = self.build(script=["c", "d"], payloads=[payload(LEADER_POSES[0])])
+        live.step()
+        live.step()
+        self.assertIn("--arm", live.message)
+        self.assertEqual(live.directions, [])
+
+    def test_backspace_takes_back_the_last_direction(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c", "d", "+", "-", "\x7f", "-", "+", "+", "-", "+"],
+                          payloads=[payload(LEADER_POSES[0])], arm=arm)
+        self.play(live)
+        self.assertEqual(live.directions, [1.0, -1.0, 1.0, 1.0, -1.0, 1.0])
+
+    def test_a_cancelled_prompt_writes_nothing(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c", "d", "+", "x", "q"],
+                          payloads=[payload(LEADER_POSES[0])], arm=arm)
+        for _ in range(5):
+            live.step()
+        self.assertFalse(live.wrote_map)
+        self.assertFalse(live.map_path.exists())
+        self.assertIsNone(live.awaiting)
+        # The pose survived, so the operator can just press d again.
+        self.assertEqual(len(live.poses), 1)
+
+    def test_every_joint_is_asked_in_turn(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c", "d"], payloads=[payload(LEADER_POSES[0])], arm=arm)
+        live.step()
+        live.step()
+        self.assertIn("joint 1", live.message)
+        live.handle("+")
+        self.assertIn("joint 2", live.message)
+        drawn = self.stream.getvalue()
+        self.assertIn("J1 direction", drawn)  # The prompt names the joint on screen.
+
+    def test_the_prompt_shows_how_far_the_joint_has_moved(self):
+        # This is the evidence the operator decides from: move J1 and see whether
+        # the arm reading moves with the leader or against it.
+        arm = FakeArm([arm_for(LEADER_POSES[0]), arm_for(LEADER_POSES[1])])
+        live = self.build(script=["c", "d"],
+                          payloads=[payload(LEADER_POSES[0]), payload(LEADER_POSES[1])],
+                          arm=arm)
+        live.step()  # Capture the reference: leader pose 0 against arm pose 0.
+        live.step()  # Both sides have been moved on to pose 1.
+        self.assertIn("moved since the pose", self.stream.getvalue())
+        leader_step, arm_step = live.live_step(0)
+        self.assertAlmostEqual(leader_step, shortest_delta(LEADER_POSES[1][0],
+                                                           LEADER_POSES[0][0]))
+        self.assertAlmostEqual(arm_step, arm_for(LEADER_POSES[1])[0]
+                               - arm_for(LEADER_POSES[0])[0])
+
+    def test_signing_off_without_checking_writes_and_says_it_was_unchecked(self):
+        arm = FakeArm([arm_for(LEADER_POSES[0])])
+        live = self.build(script=["c", "d", "+", "+", "+", "+", "+", "+", "\r"],
+                          payloads=[payload(LEADER_POSES[0])], arm=arm)
+        for _ in range(9):
+            live.step()
+        self.assertTrue(live.wrote_map)
+        self.assertIn("not checked against a second pose", self.stream.getvalue())
+
+    def test_a_second_pose_can_confirm_the_directions(self):
+        script = ["c", "d", "+", "+", "+", "+", "+", "+", "c"]
+        arm = FakeArm([arm_for(LEADER_POSES[0]), arm_for(LEADER_POSES[1])])
+        live = self.build(script=script,
+                          payloads=self.held(LEADER_POSES[0], LEADER_POSES[1], script),
+                          arm=arm)
+        self.play(live)
+        self.assertTrue(live.wrote_map)
+        self.assertIn("checked 6 joint(s)", self.stream.getvalue())
+
+    def test_a_second_pose_that_contradicts_a_direction_refuses_to_write(self):
+        # J1 answered the wrong way round; the second pose exposes it.
+        script = ["c", "d", "-", "+", "+", "+", "+", "+", "c"]
+        arm = FakeArm([arm_for(LEADER_POSES[0]), arm_for(LEADER_POSES[1])])
+        live = self.build(script=script,
+                          payloads=self.held(LEADER_POSES[0], LEADER_POSES[1], script),
+                          arm=arm)
+        self.play(live)
+        self.assertFalse(live.wrote_map)
+        self.assertFalse(live.map_path.exists())
+        self.assertIn("contradicts J1", live.message)
+        self.assertEqual(len(live.poses), 2)  # Kept: re-answering costs less.
+
+    def test_a_second_pose_that_checks_nothing_does_not_pass_as_a_check(self):
+        # Same pose twice: the check can say nothing about any joint, so it must
+        # not quietly write the map as though it had.
+        script = ["c", "d", "+", "+", "+", "+", "+", "+", "c"]
+        arm = FakeArm([arm_for(LEADER_POSES[0]), arm_for(LEADER_POSES[0])])
+        live = self.build(script=script,
+                          payloads=self.held(LEADER_POSES[0], LEADER_POSES[0], script),
+                          arm=arm)
+        self.play(live)
+        self.assertFalse(live.wrote_map)
+        self.assertEqual(live.awaiting, "verify")  # Still offering both ways out.
+        self.assertIn("too close to the reference", live.message)
 
     def test_the_session_command_captures_from_a_terminal_and_a_port(self):
         """The whole command: a real pty keyboard, a real pty leader, no SDK."""

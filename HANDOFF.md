@@ -68,7 +68,7 @@ bash scripts/install_dependencies.sh --sdk --dry-run
 | `protocol.py` | 临时 JSON 行协议；`Command`、`ProtocolError` 与 `feed(bytes)` 契约 |
 | `leader_decoder.py` | 外接遥操作器 USART3 文本流解码器；见第 6 节末的契约 |
 | `leader_map.py` | 单圈角度 → 关节弧度的标定映射；路径解析的唯一权威 |
-| `leader_calibrate.py` | 标定工具：`session` 交互采样、`sample` 单次采样、`fit` 出映射；见第 6.2 节 |
+| `leader_calibrate.py` | 标定工具：`session` 交互采样（单点手输方向，或多点拟合）、`sample` 单次采样、`fit` 出映射；见第 6.2 节 |
 | `operator_keys.py` | 本地按键 arm/stop 通道（必须叫这个名字，见文件内注释） |
 | `control.py` | STOPPED / ACTIVE / FAULT 状态机、范围检查、限速、超时、跟随误差 |
 | `backends.py` | `MockArm` 与 `VendorArm`；真实 SDK 状态映射、构造/模式切换 |
@@ -226,9 +226,9 @@ decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` �
 所以一个进程里把两侧一直开着，用**最近 `--window` 秒（默认 1.5 s）的滚动窗口**当作"当前姿态"，
 按键才落盘。测试通过注入伪 source/arm/keys/clock 把它变成确定性的（见 `InteractiveTests`）。
 
-- 按键：`c`/回车采集、`u` 撤销、`f` 拟合并写 map（失败不退出，继续补姿态）、
-  `q` 退出、`h` 帮助。`q` 提前退出会把已采姿态写进 `--out` 并以**退出码 2** 结束
-  ——"采了一半"和"标定完成"必须能分开，事后可用 `fit` 接着用。
+- 按键：`c`/回车采集、`d` 单点路径（见下）、`u` 撤销、`f` 拟合多个姿态并写 map
+  （失败不退出，继续补姿态）、`q` 退出、`h` 帮助。`q` 提前退出会把已采姿态写进 `--out`
+  并以**退出码 2** 结束——"采了一半"和"标定完成"必须能分开，事后可用 `fit` 接着用。
 - 按键读的是 **原始字符**：为此把 `operator_keys.KeyInput.poll()` 拆成
   `read_keys()`（原始字符）+ `poll()`（映射成 arm/stop），后者行为不变，
   现有调用方与测试不受影响。
@@ -243,7 +243,25 @@ decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` �
 （前提是方向已知），姿态之间的变化给出方向。**第一个采的姿态是基准姿态**，
 `unwrap` 的圈数从它数起。
 
-已实现并已被测试固定的语义：
+**两条路径，单点那条是默认。**
+
+**单点 + 手输方向**（`d`）：以已采的**第一个**姿态为基准，`InteractiveSession.start_directions()`
+逐关节（J1..J6）问方向，`+`/`-` 作答、backspace 退一个、`x` 取消。提示行用
+`live_step(index)` 显示该关节相对基准姿态的位移（`shortest_delta` 的 leader 位移 + arm 位移），
+这就是操作者据以判断的证据。六个答完后 `answer_verify` 给三个出口：`c` 复核、回车直接写、`x` 取消。
+**提示期间按键完全归提示**（`handle()` 先看 `awaiting`），所以 `q` 在那个状态下不退出——
+要退先 `x` 取消；Ctrl+C 仍然直接中断（不经过 `run()`）。
+
+- 写文件走 `single_point_map(pose, signs)`：`offset_deg = arm_deg - sign * raw_deg`，
+  **故意不折进 ±180**——这个数就是字面意思，而映射恰好在这个基准姿态上精确成立。
+  文件里带 `HAND_ENTERED_EVIDENCE` 注释，明说方向是人打的、错了会让关节镜像。
+- **复核是有牙齿的**：`verify_directions()` 比较基准姿态与新姿态，`arm_step` 必须与
+  `sign * leader_step` 同号；任一关节相反 → **点名该关节并拒绝写文件**；
+  一步小于 `VERIFY_MIN_DEG`（5°）的关节记为"没动够、没复核到"；**一个都没复核到也不写**
+  （否则会看起来像通过了）。复核用的是最新的姿态（`self.poses[-1]`），所以 `c` 可以按多次。
+- 单点路径**没有数据能反驳手打的符号**，这是它与 `fit` 的取舍：`fit` 由数据自证但要多摆几次。
+
+**多点拟合**（`f`，备用；也是无终端时 `sample` + `fit` 的唯一路径）已实现并已被测试固定的语义：
 
 - 复用 `app.SerialInput`（`exclusive=True`）与 `LeaderUartDecoder`——**不重写线格式**。
   `SamplingDecoder` 只重写 `_decode`，把每个通过校验的帧记下来；采的是
@@ -291,17 +309,18 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 175 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 195 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
 | 标定工具测试 | 恒等/反向/带偏移、噪声、跨度不足、机械臂未动、非 1:1 斜率、姿态不互洽、跨绕圈点、拒绝写文件、生成的映射能被加载器读回并经 `Mapper` 复现采样到的臂角 |
 | 交互式标定测试 | 注入伪 source/arm/keys/clock：滚动窗口只含当前姿态、撤销、未动够的关节被点名、`f` 失败留在循环里、整圈跑完写出可加载的 map、提前 `q` 以退出码 2 结束且留下的姿态能被 `fit` 直接使用 |
+| 单点 + 手输方向（离线） | 六个 `+`/`-` 写出可加载的 map 并被 `Mapper` 复现出采样到的臂角；offset 不折 ±180；backspace 退格；`x` 不写文件；没有姿态/没有 `--arm` 时给出原因；复核通过才写、**位移与符号相反时点名拒绝**、**一个关节都复核不到也拒绝写**、没动的关节报为未复核（`DirectionTests` 用纯函数直接验这四种判定） |
 | `session` 端到端（PTY 终端 + PTY 串口，无 SDK） | 真按键 → 真串口 → 采集 1 个姿态、退出码 2、arm.log 为空（未加载厂商库） |
 | `VendorChatter` fd 重定向 | fd 1/2 都进日志、退出后两个 fd 都回到原目标（分别 dup，不共用副本） |
 | 重力补偿接线（离线，无硬件） | `set_arm_status(3)` 恰好一次、跟踪目标时拒绝切模式、`close()` 后最后一条是 SOFT；`--arm` 的构造→进 3→读→`close()` 顺序；`confirm_release` 确认才 `stop()`、stdin 关闭也回 SOFT；**中断路径不进确认提示但 `close()` 仍执行** |
 | SIGTERM 处理 | 真给自己发 SIGTERM：变成 `KeyboardInterrupt`（若未安装处理器，测试进程会被直接杀掉，不会静默通过）；处理前后 `SIGTERM` 处理器被恢复 |
-| 重力补偿真机 | **未验证**，从未在硬件上进入过状态 3 |
+| 重力补偿真机 | **未验证**：2026-10-03 操作者跑起过一次 `session --arm` 并报"正确启动"（无报错），但托住/下沉/漂移的表现没有反馈（见第 12.11 节末） |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -332,9 +351,11 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
 4. 支撑机械臂，先用 monitor 验证 SOFT 与六关节读数方向/单位，再校准限位。
    保留外部急停，验证停止/断流的实际行为；不要自动回零或发送示例绝对位置。
 5. leader 解码器已接入（第 6.1 节），标定工具已就绪（第 6.2 节）。
-   **下一步是摆姿态采数据**：交互式跑
+   **下一步是采一个姿态、手输方向**：交互式跑
    `bash scripts/calibrate.sh session --arm --model 2023 --can-port can0 --serial <by-id>`，
-   每个姿态按 `c`，看状态行的 `still needing range` 补关节，够了按 `f` 直接写 `leader_map.json`。
+   把两边摆成同一姿态按 `c`，然后按 `d` 逐关节回答方向（`+`/`-`，提示行会显示该关节动到哪了），
+   最后**建议按 `c` 挪到另一个明显不同的姿态复核一次**再写 `leader_map.json`；
+   复核不过或想由数据自证，就多摆几个姿态按 `f` 走多点拟合。
    **`--arm` 会让机械臂进重力补偿（状态 3，电机驱动）**：先在支撑好、手能扶到、电源够得着的
    条件下确认它真的托得住（会因 URDF 不含实际负载而缓慢漂移，这是预期），再开始采集。
    结束时工具会**停下来问**，等你确认支撑好、按回车才交回 SOFT。没有任何外部急停，
@@ -343,6 +364,7 @@ leader 解码器还额外在 Robot PC 上对着**真实串流**跑通（见第 1
    所以拟合斜率必须≈±1；不通过就重摆姿态，不要放宽容差。
    门禁会一直挡着实机 teleop，直到 `leader_map.json` 上写了 `"calibrated": true`。
    **第一个采的姿态是基准姿态**：交互模式已经把它的原始角度写进 map 的 comment。
+   手输方向这条路**没有任何数据能反驳符号**，所以复核那一步不是走过场。
 6. 标定之后再处理第 9.1 节列出的两个解码器缺口（冻结值、值域内静默错误），
    然后才做低速实机控制，并从 mock 换成 `--backend sdk`。
 7. 如要求真正失能，需厂商提供关闭/失能及失能后读反馈的正式 API/协议，当前不能承诺。
@@ -559,3 +581,25 @@ bash scripts/run.sh --mode teleop --backend mock \
 - 离线验证：175 项测试通过（新增 12 项，见第 8 节表格）。顺序与中断路径都用 mock 厂商类固定。
 - **状态 3 从未在真机上跑过**：力矩来自 KDL + URDF 动力学，实际负载/夹爪不在模型里就会缓慢漂移；
   下一步真机验证必须支撑好、有人扶着、电源够得着，先看它是托住还是下沉/漂移再决定用不用。
+- 2026-10-03 操作者在 Robot PC 上跑起过一次 `session --arm`，**报"已经正确启动了"**：
+  命令行、串口与 `--arm` 的进入路径都没报错。**但这不等于重力补偿有效**——它究竟托住了、
+  下沉了还是漂移了，以及退出前那一步确认的表现，都还没有反馈，所以第 8 节那一行仍是"未验证"。
+
+### 12.12 标定改成单点 + 手输方向（2026-10-03）
+
+- 起因（用户要求）：**"只取一个点，然后让我自己观测关节方向，然后我自己输入终端"**。
+  一个姿态 + 已知方向就能精确解出零位，所以多点拟合不是必需的。
+- 用户确认的三点：逐关节依次提示（J1..J6，各答 `+`/`-`）；`fit` 那套**保留为备用**；
+  写文件**前可选复核**一次。
+- `leader_calibrate.py` 新增 `single_point_map()`、`verify_directions()`、`shortest_delta()`、
+  `HAND_ENTERED_EVIDENCE`，`InteractiveSession` 加 `d` 键与 `direction`/`verify` 两个待答状态，
+  `draw()` 用 `>` 标出正在问的关节并显示 `live_step()` 的 leader/arm 位移。
+- 复核**不是走过场**：位移与符号相反 → 点名拒绝写；一个关节都复核不到 → 也不写（否则看起来像通过）；
+  没动够（<`VERIFY_MIN_DEG`=5°）的关节报为"未复核"。写了 map 会带 `HAND_ENTERED_EVIDENCE` 注释，
+  明说方向是人打的、错了会让该关节在离开基准姿态后镜像。
+- 已实现并测得 195 项通过（新增 `DirectionTests` 6 项 + `InteractiveTests` 10 项）。
+  `DirectionTests` 里专门钉住了**符号与实际位移方向解耦**这一点：基准姿态对里有的关节
+  位移为负，`+` 仍必须判为一致——这正是 `verify_directions()` 第一版写错的地方
+  （曾写成"两边都为正才算一致"，会把所有反向移动的关节误报为矛盾）。
+- **单点路径与 `fit` 的取舍**：`fit` 由数据自证但要多摆几次；单点快，但**没有任何数据能反驳
+  手打的符号**，复核是唯一的保护。这一点同时写进了 README 的标定一节和生成文件的注释。
