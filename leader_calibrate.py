@@ -171,6 +171,9 @@ def unwrap_from_reference(leader):
     other pose the same way. A joint that really travelled more than half a turn
     between poses is then modelled as having gone the short way round, which the
     slope check in ``fit_joint`` catches rather than hides.
+
+    The angles fed in have to be the poses' *raw* readings for that reference to
+    be the one a teleop session can reproduce -- see ``fit_session``.
     """
     reference = leader[0]
     return [value + 360.0 * round((reference - value) / 360.0) for value in leader]
@@ -242,7 +245,12 @@ def fit_session(poses, min_span, slope_tolerance, tolerance):
         return [], [f"need at least {MIN_POSES} poses, session has {len(poses)}"]
     if any(pose.get("arm_deg") is None for pose in poses):
         return [], ["session has poses without arm angles; sample again with --arm"]
-    leader = [pose["continuous_deg"] for pose in poses]
+    # Raw angles, not the session's unwrapped ones: ``unwrap_from_reference``
+    # below re-anchors everything on pose 1, and the runtime mapper reproduces
+    # that anchor only if it is pose 1's *raw* angle. Feeding it the capture
+    # session's continuous angles would anchor the offsets on wherever that
+    # session happened to start, which no later teleop run can reproduce.
+    leader = [pose["raw_deg"] for pose in poses]
     arm = [pose["arm_deg"] for pose in poses]
     results = [
         fit_joint([values[joint] for values in leader],

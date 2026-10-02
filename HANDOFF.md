@@ -302,6 +302,10 @@ decoder 侧 opt-in 的（`calibrated` / `provides_arm`），`JsonLineDecoder` �
 - 拟合用**相对基准姿态的最近圈**展开（`unwrap_from_reference`），与运行期 `Mapper`
   从第一帧按最短路径展开的约定一致。真行程超过半圈时最短路径会选错圈，
   此时斜率会明显偏离 ±1，**被拒绝而不是被将就**。
+- 喂进展开的必须是 **`raw_deg`**，不是 `continuous_deg`：后者展开自**采集进程**开始
+  流数据的那一刻，而运行期是从**遥操作进程**的第一帧展开。两者差着整圈时，
+  拟合出的 `offset_deg` 会整体偏 `360 * sign`，而斜率、跨度、残差**全都照常通过**
+  （整圈被 offset 吸收），直到 arm 的那一刻才变成机械臂走 360°。见第 12.16 节。
 - 判定：leader 跨度 ≥30°、|斜率| 与 1 的差 ≤0.05、最大残差 ≤3°。**任一关节不过就
   整个拒绝、不写文件**（没有 `--force`）：只标定一半的映射比没标定更危险。
 - 写文件前先把它喂给 `leader_map.load_mapping` 读一遍——**加载器不收的映射比没有映射更糟**，
@@ -365,7 +369,7 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 
 | 项目 | 结果 |
 | --- | --- |
-| `.venv/bin/python -m unittest discover -s tests -v` | 219 项通过，含真实 pyserial + PTY |
+| `.venv/bin/python -m unittest discover -s tests -v` | 220 项通过，含真实 pyserial + PTY |
 | leader 解码器离线测试 | 拆行、握手、`-1` 预热/故障、越界、缠绕展开、映射、`reset()` 语义 |
 | leader 端到端（PTY，全 mock） | 字节 → 解码 → 映射 → 状态机 → 按键 arm/stop/FAULT 恢复 |
 | 本地按键通道测试 | cbreak 的 termios 恢复、非 tty 回退、单批多键、fd 生命周期 |
@@ -378,7 +382,8 @@ apt 源缺包时脚本在安装包之前退出（apt-get update 可能已执行�
 | SIGTERM 处理 | 真给自己发 SIGTERM：变成 `KeyboardInterrupt`（若未安装处理器，测试进程会被直接杀掉，不会静默通过）；处理前后 `SIGTERM` 处理器被恢复 |
 | 重力补偿真机 | **操作者反馈"基本能用"**（2026-10-03，未量化）：跑完过一次 `session --arm`（1 个 301 帧、0 坏帧的姿态，见第 12.14 节），据此认为状态 3 能托住机械臂，标定流程不需要再等它 |
 | 真机标定产物 | 已生成 `leader_map.json`（方向 `+ − − − + −`，手输，**未经第二姿态复核**），见第 12.14 节 |
-| 基准姿态门禁（离线） | `check_reference` 的边界与绕圈判据（跨 `0/360` 的 10° 报成 350°）；map 校验 `reference_deg` 的长度/数值/`0..360` 区间；解码器在首个有效帧判一次、`-1` 预热帧不判、握手与 `ProtocolError` 后重判、判过就锁定不再改；`reference_deg` 缺失时报告 `checked: false` 且不拦；PTY 端到端：起始帧正确→`a` 进 ACTIVE、起始帧偏 90°→`reason` 点名 J3 且 `joints_rad` 全程为 0（机械臂一个目标都没收到）、首帧之前按 `a` 被拒 |
+| 基准姿态门禁（离线） | `check_reference` 的边界与绕圈判据（跨 `0/360` 的 10° 报成 −350°）；map 校验 `reference_deg` 的长度/数值/`0..360` 区间；解码器在首个有效帧判一次、`-1` 预热帧不判、握手与 `ProtocolError` 后重判、判过就锁定不再改；`reference_deg` 缺失时报告 `checked: false` 且不拦；PTY 端到端：起始帧正确→`a` 进 ACTIVE、起始帧偏 90°→`reason` 点名 J3 且 `joints_rad` 全程为 0（机械臂一个目标都没收到）、首帧之前按 `a` 被拒 |
+| `fit` 的锚点（离线） | 夹具把 session 的 `continuous_deg` 整体挪一圈（`raw` 不变）后，写出的 map 仍能被新 `Mapper` 从 `raw` 复现出记录的臂角；**把这一行改回 `continuous_deg` 该测试即以 360.0 的差值失败**（三条测试同时失败），见第 12.16 节 |
 | `bash -n scripts/*.sh` | Shell 语法检查通过 |
 | `install_dependencies.sh --mock --skip-system` | 新 venv 实际安装 pyserial 3.5 成功 |
 | `scripts/run.sh` | 模拟启动通过；测试覆盖不同 cwd、带空格路径、参数转发和 SDK 选择 |
@@ -817,3 +822,37 @@ decoder 侧 opt-in，`JsonLineDecoder` 不声明就不受影响），而且缺�
 `pose["continuous_deg"]`，而单点路径用的是 `raw_deg`。对这份真机 session 而言
 **两者不等**（J2：`continuous_deg` = −37.2，`raw_deg` = 322.8），也就是当初若用 `fit`
 而不是单点，写出的 map 会在 J2 上整体偏 360°。
+
+### 12.16 修掉 12.15 暴露的 `fit` 锚点错误（2026-10-03）
+
+第 12.15 节末尾记下的那件事已修。**纯软件改动，全部离线验证**，没碰真机、没碰 SDK。
+
+**错在哪。** `fit_session` 把 `pose["continuous_deg"]` 交给 `unwrap_from_reference`，
+那是对**采集进程**而言的展开角：它的原点是采集 session 开始流数据的那一刻，不是姿态 1。
+运行期不是这样——`Mapper` 以**它自己看到的第一帧原始角**为原点。两个原点差着整圈时，
+拟合出来的 `offset_deg` 就整体偏 `360 * sign`，而**这一圈不会在拟合里露出来**：
+整圈的差被 `offset_deg` 吸收，`slope`、`span`、`max_residual` 全部照常通过。等到遥操作
+一 arm，机械臂就朝那个方向走 360°——这正是第 12.15 节里说的那类"没有任何检查看得见"的错。
+
+**证明它是真的，而不是理论上的**：这份真机 session 的 J2，`continuous_deg` = −37.2、
+`raw_deg` = 322.8，差正好一圈。J2 的 `sign` 是 −1，所以当初若用 `fit` 写 map，
+**J2 的每个目标都会差整整 360°**（其余五个关节两者相等，不受影响）。
+
+**改法**：`fit_session` 改喂 `pose["raw_deg"]`；`unwrap_from_reference` 的 docstring 补上
+"喂进来的必须是 raw"这一条契约；`build_map` 里说明 `reference_deg` 取 raw 的那段注释
+与之呼应。
+
+**测试**：新增
+`test_the_fit_is_anchored_on_raw_angles_not_the_session_origin`——夹具把 session 的
+`continuous_deg` 整体挪一圈而 `raw_deg` 不动（模拟"采集前操作者把某个关节转过零点"），
+断言写出的 map 经新 `Mapper` 从 `raw` 驱动，仍复现出记录的 `arm_deg`。
+**已验证它在改回 `continuous_deg` 时会以 360.0 的差值失败**，不是个恒真断言。
+另有两处既有夹具本来靠改 `continuous_deg` 来"让某关节不动"（J3 不动、J5 不动），
+现在改的是 `raw_deg`——否则这两条测试会因为改错了列而**悄悄失去被测行为**。
+
+**顺带把真机那份 map 补成工具会写出的样子**：仓库根目录的 `leader_map.json`
+（gitignored）由 `build_map(single_point_map(...), HAND_ENTERED_EVIDENCE)` 用记录在案的
+方向 `+ − − − + −` 重新生成，`diff` 确认**除新增 `reference_deg` 与那两行注释的措辞外，
+sign 与 offset 逐位相同**。原来那两行注释正是第 12.15 节纠正过的"差一圈偏 360°"说法，
+一并换掉。逐关节用 `sign * raw + offset` 复算，与同一姿态记录的 `arm_deg` 六维全部吻合到
+小数点后 4 位。

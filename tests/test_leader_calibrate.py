@@ -55,7 +55,8 @@ def fitted_map(poses, results):
 
 
 def fit_column(poses, joint, min_span=30.0, tolerance=3.0):
-    return fit_joint([pose["continuous_deg"][joint] for pose in poses],
+    """One joint's fit, fed the same column ``fit_session`` feeds it."""
+    return fit_joint([pose["raw_deg"][joint] for pose in poses],
                      [pose["arm_deg"][joint] for pose in poses],
                      min_span, 0.05, tolerance)
 
@@ -242,7 +243,7 @@ class SessionTests(unittest.TestCase):
     def test_every_joint_is_reported_even_when_some_fail(self):
         poses = session()
         for pose in poses:
-            pose["continuous_deg"][2] = 106.0  # J3 held still
+            pose["raw_deg"][2] = 106.0  # J3 held still
         results, problems = fit_session(poses, 30.0, 0.05, 3.0)
         self.assertEqual(len(results), 6)
         self.assertEqual(len(problems), 1)
@@ -282,6 +283,29 @@ class SessionTests(unittest.TestCase):
         for pose in poses:
             radians = mapper.to_radians(pose["raw_deg"])
             for produced, expected in zip(radians, pose["arm_deg"]):
+                self.assertAlmostEqual(math.degrees(produced), expected, places=3)
+
+    def test_the_fit_is_anchored_on_raw_angles_not_the_session_origin(self):
+        # The capture session's unwrapping starts where the *decoder* was when it
+        # connected, which is not where pose 1 is: the operator may roll a joint
+        # past zero in between, leaving continuous_deg a whole turn from
+        # raw_deg. A teleop session reproduces raw angles, so the fit has to be
+        # anchored there too. Anchoring on the session origin instead is close to
+        # invisible -- the whole turn is absorbed into offset_deg, and the slope,
+        # span and residual checks all still pass -- and then comes back here as
+        # a 360 degree error the first time the arm is armed.
+        poses = session()
+        for pose in poses:
+            pose["continuous_deg"] = [value + 360.0 for value in pose["raw_deg"]]
+            pose["arm_deg"] = arm_for(pose["continuous_deg"])
+        results, problems = fit_session(poses, 30.0, 0.05, 3.0)
+        self.assertEqual(problems, [])
+        config = fitted_map(poses, results)
+        self.assertEqual(config["reference_deg"], LEADER_POSES[0])
+        mapper = Mapper(check_map_loads(config))
+        for pose in poses:
+            for produced, expected in zip(mapper.to_radians(pose["raw_deg"]),
+                                          pose["arm_deg"]):
                 self.assertAlmostEqual(math.degrees(produced), expected, places=3)
 
     def test_the_map_reproduces_a_session_that_crosses_the_rollover(self):
@@ -990,7 +1014,7 @@ class CommandTests(unittest.TestCase):
     def test_fit_refuses_and_writes_nothing_when_a_joint_fails(self):
         poses = session()
         for pose in poses:
-            pose["continuous_deg"][4] = 299.3  # J5 never moved
+            pose["raw_deg"][4] = 299.3  # J5 never moved
         self.write_session(poses)
         self.assertEqual(main(["fit", str(self.session), "--out", str(self.out)]), 2)
         self.assertFalse(self.out.exists())
