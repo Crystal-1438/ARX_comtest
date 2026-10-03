@@ -1,0 +1,13 @@
+{
+  "precision": "float only",
+  "host": "x86_64",
+  "configurations_including_output_modes": 59832,
+  "seed": 20261003,
+  "maximum_angle_rad": 128,
+  "max_absolute_error_nm": 2.1511475907232125e-06,
+  "precomputed_sincos_max_error_nm": 2.0808721412635123e-06,
+  "kdl_vendor_fixture_max_error_nm": 9.544817327622468e-07,
+  "core_undefined_symbols": [],
+  "dynamic_allocation": false,
+  "stm32_hardware_tested": false
+}

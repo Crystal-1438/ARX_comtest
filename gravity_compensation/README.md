@@ -1,5 +1,16 @@
 # ARX X5 独立重力补偿计算
 
+**当前推荐交付是 [c/ 下的纯 C99 / float 版本](c/README.md)，面向 STM32，无外部依赖，连 libm 也不需要。**
+复制 `x5_gravity.c`、`x5_gravity.h`、`x5_gravity_data.h` 三个文件即可接入。
+其余 Python 实现及 KDL 源码保留作算法说明、模型常量生成和独立验证参考。
+
+```c
+float torque[6];
+int rc = x5_gravity_compute(X5_MODEL_2025, q, 0, X5_GRAVITY_SDK, torque);
+```
+
+下文说明原始提取链路与 Python 验证参考；C 版本的范围、接口和资源优化见上述链接。
+
 本目录提取 ARX X5 的 **URDF → 静态重力力矩 → 厂商缩放后的力矩指令**。
 整个目录可以单独复制，Python 3.10+ 即可运行；不需要 NumPy、ROS、KDL 动态库、
 厂商 SDK 或 CAN。没有硬件初始化、模式切换和发送命令的逻辑。
