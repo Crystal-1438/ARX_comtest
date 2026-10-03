@@ -74,8 +74,49 @@ URDF 的 joint rpy 则必须参与几何变换，顺序是 `Rz(yaw) Ry(pitch) Rx
 
 运行项目测试：`.venv/bin/python -m unittest discover -s tests -v`。
 当前测试包含单摆解析解、移动关节与固定负载、三个型号的势能数值梯度、
-倾斜/反向/零重力、输入校验和不加载 site-packages 的 CLI。
-真实 KDL 数值交叉检查另见后续验证脚本；未经实机测试。
+倾斜/反向/零重力、输入校验、不加载 site-packages 的 CLI，以及独立原生计算生成的回归样例。
+
+已完成两层原生数值验证，固定随机种子 `20261003`：
+
+| 对比对象 | 覆盖范围 | 最大绝对误差 |
+| --- | --- | --- |
+| 原版 KDL 1.5.1 `JntToGravity` | 3 个型号 × 105 个姿态 × 3 个重力向量 = 945 组 | 3.56e-15 N·m 以下 |
+| 厂商 `.so` 的 `computeGravityCompensationTorque` | 3 个型号 × 105 个姿态 = 315 组，包含厂商缩放 | 3.56e-15 N·m 以下 |
+
+两层对比都不连接硬件。第二层是锁定特定 x86_64 库的数学方法 ABI 探针，**不构造厂商对象**，
+不验证厂商 URDF 解析、CAN、驱动器及实机；具体边界见 [PROVENANCE.md](PROVENANCE.md)。
+报告见 `verification/result.json`，15 组独立回归样例见 `verification/fixtures.json`。
+
+要重做原生验证，在项目根目录执行（需 C++17 编译器、CMake；仅验证需要 Eigen）：
+
+```bash
+cmake -S gravity_compensation/verification -B build/gravity-reference -DCMAKE_BUILD_TYPE=Release
+cmake --build build/gravity-reference -j 2
+python3 gravity_compensation/verification/verify.py
+
+# 可选：同固定厂商库的纯数学方法比较。此命令不会构造 SDK 控制器。
+python3 gravity_compensation/verification/verify.py \
+  --vendor-library vendor/ARX_X5/py/arx_x5_python/bimanual/lib/arx_x5_src/libarx_x5_src.so
+```
+
+编译默认使用项目 vendor 中现有的 Eigen 头文件；也可通过
+`-DEIGEN_INCLUDE_DIR=/path/to/eigen3` 指定位置。安装在虚拟环境中的 CMake 可用
+`.venv/bin/cmake` 调用。**正常 Python 计算完全不需要这个编译步骤。**
+`libkdl_parser.so` 占位文件只用于隔离数学探针，不实现解析，不应作为真实 SDK 的依赖使用。
+不要将验证目录加入实机程序的库搜索路径。
+
+校验所有原样复制文件：
+
+```bash
+python3 - <<'PY'
+import hashlib, json
+from pathlib import Path
+root = Path('gravity_compensation')
+for name, digest in json.loads((root / 'UPSTREAM_SHA256.json').read_text()).items():
+    assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest, name
+print('upstream checksums OK')
+PY
+```
 
 新提取的 Python 实现采用 LGPL-2.1-or-later，保留 KDL 算法作者说明，许可证为本目录
 `LICENSE`。`reference/orocos_kdl` 保留其 LGPL 源文件；`reference/kdl_parser` 保留

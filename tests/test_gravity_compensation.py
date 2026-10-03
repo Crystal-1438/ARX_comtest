@@ -13,6 +13,17 @@ from gravity_compensation import GravityCompensator, SDK_SCALES
 
 
 class GravityTests(unittest.TestCase):
+    def test_independent_kdl_and_vendor_regression_fixtures(self):
+        path = Path(__file__).resolve().parents[1] / "gravity_compensation/verification/fixtures.json"
+        fixtures = json.loads(path.read_text())
+        self.assertEqual(len(fixtures["cases"]), 15)
+        for case in fixtures["cases"]:
+            model = GravityCompensator.from_model(case["model"])
+            for actual, expected in zip(model.raw_torques(case["q"]), case["raw"]):
+                self.assertAlmostEqual(actual, expected, delta=1e-11)
+            for actual, expected in zip(model.sdk_torques(case["q"]), case["sdk"]):
+                self.assertAlmostEqual(actual, expected, delta=1e-11)
+
     def load_xml(self, xml, **kwargs):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "robot.urdf"
@@ -86,6 +97,20 @@ class GravityTests(unittest.TestCase):
             GravityCompensator.from_model("2025", gravity=(0, 0, math.nan))
         with self.assertRaises(ValueError):
             GravityCompensator.from_model("guess")
+
+    def test_invalid_chain_and_unsupported_mimic_rejected(self):
+        template = '''<robot name="test"><link name="base_link"/><link name="link6"/>
+          <joint name="hinge" type="{kind}"><parent link="{parent}"/>
+          <child link="link6"/><axis xyz="{axis}"/>{extra}</joint></robot>'''
+        for kind, parent, axis, extra in (
+            ("floating", "base_link", "0 1 0", ""),
+            ("revolute", "base_link", "0 0 0", ""),
+            ("revolute", "link6", "0 1 0", ""),
+            ("revolute", "missing", "0 1 0", ""),
+            ("revolute", "base_link", "0 1 0", '<mimic joint="other"/>'),
+        ):
+            with self.assertRaises(ValueError):
+                self.load_xml(template.format(kind=kind, parent=parent, axis=axis, extra=extra))
 
     def test_only_selected_chain_contributes(self):
         xml = '''<robot name="branch"><link name="base_link"><inertial>

@@ -1,0 +1,11 @@
+{
+  "kdl_version": "1.5.1",
+  "seed": 20261003,
+  "poses_per_model": 105,
+  "vendor_library_sha256": "cb51e1acfccd1e904ca263d45db2035fb33a457ded0b64e5376a864aaf1abeb5",
+  "raw_max_abs_error": 3.552713678800501e-15,
+  "vendor_max_abs_error": 3.552713678800501e-15,
+  "raw_configurations": 945,
+  "vendor_configurations": 315,
+  "scope": "offline math only; no vendor constructors/CAN/hardware"
+}

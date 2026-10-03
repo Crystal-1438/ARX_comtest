@@ -5,6 +5,7 @@
 - 仓库：<https://gitee.com/li-bozha0/ARX_X5>
 - 固定提交：`c78328785ea23a81d908e1dcc551eca992f2f1e9`
 - 二进制：`py/arx_x5_python/bimanual/lib/arx_x5_src/libarx_x5_src.so`，Linux x86_64。
+- SHA256：`cb51e1acfccd1e904ca263d45db2035fb33a457ded0b64e5376a864aaf1abeb5`。
 - Python 入口：`bimanual/script/single_arm.py:116`，调用 `set_arm_status(3)`。
 - 模型：该目录下三个 `x5*.urdf`，原样复制至 `models/`。
 
@@ -24,6 +25,13 @@
 
 这仅还原了计算与重力模式的命令字段。CAN 打包、电机电流换算、驱动器限幅、整机
 保护和通信线程不属于本次计算模块。未确认系数的标定含义，也没有用推测替代厂商源码。
+
+`verification/sdk_evidence.asm` 保留该二进制中相关方法的反汇编片段及浮点常数。
+`verification/kdl_reference.cpp` 的可选 ABI 探针只调用其中的纯数学方法：
+提供一个真实 KDL ChainDynParam 对象，以及该方法读取的六关节数量和 solver 指针。
+对应字段位于 `this+0xc8` 和 `this+0xf8`。没有执行 ARX 类构造函数、URDF 解析器或硬件线程。
+Python 验证驱动锁定架构和上述 SHA256，不能将这些偏移复用于其他厂商版本。
+这项验证证明该方法的计算/缩放输出，不代表完成了 SDK 的初始化或整机控制验证。
 
 ## Orocos KDL
 
