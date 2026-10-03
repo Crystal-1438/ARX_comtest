@@ -1,0 +1,645 @@
+{
+  "schema_version": 1,
+  "source": {
+    "commit": "c78328785ea23a81d908e1dcc551eca992f2f1e9",
+    "binary": "vendor/ARX_X5/py/arx_x5_python/bimanual/lib/arx_x5_src/libarx_x5_src.so",
+    "sha256": "cb51e1acfccd1e904ca263d45db2035fb33a457ded0b64e5376a864aaf1abeb5",
+    "config_files": [
+      {
+        "path": "ROS/X5_ws/src/ARX_X5_ros_V7/arx_x5_controller/config/arm_config.yaml",
+        "copy": "reference/ros1_arm_config.yaml",
+        "sha256": "f6abe81d5688cc14e7f413f3c9ff894dc7def1931fb55a7146312352fbe76fdd"
+      },
+      {
+        "path": "ROS2/X5_ws/src/arx_x5_ros2/arx_x5_controller/config/v2_collect.yaml",
+        "copy": "reference/ros2_v2_collect.yaml",
+        "sha256": "969ce69f53603c360a48b873b3550d44f77876010fa7efa693fbb998f7b2c9ad"
+      }
+    ]
+  },
+  "scope": "Pinned Python SDK binary. Protocol limits are not rated motor specifications. Values are SDK coordinates; radians for joint position. Firmware parameters unavailable.",
+  "joint_parameters": [
+    {
+      "joint": 1,
+      "can_id": 1,
+      "sdk_motor_type": 4,
+      "position_min_rad": -2.618,
+      "position_max_rad": 3.14,
+      "home_rad": 0.0,
+      "position_kp": 150.0,
+      "position_kd": 1.0,
+      "position_ki": 50.0,
+      "protect_kd": 1.0,
+      "sdk_gravity_scale": 0.8,
+      "feedback_current_threshold": 13.0
+    },
+    {
+      "joint": 2,
+      "can_id": 2,
+      "sdk_motor_type": 4,
+      "position_min_rad": -0.1,
+      "position_max_rad": 3.6,
+      "home_rad": 0.0,
+      "position_kp": 150.0,
+      "position_kd": 1.0,
+      "position_ki": 50.0,
+      "protect_kd": 4.0,
+      "sdk_gravity_scale": 0.8,
+      "feedback_current_threshold": 13.0
+    },
+    {
+      "joint": 3,
+      "can_id": 4,
+      "sdk_motor_type": 4,
+      "position_min_rad": -0.1,
+      "position_max_rad": 3.0,
+      "home_rad": 0.0,
+      "position_kp": 150.0,
+      "position_kd": 1.0,
+      "position_ki": 50.0,
+      "protect_kd": 4.0,
+      "sdk_gravity_scale": 0.8,
+      "feedback_current_threshold": 13.0
+    },
+    {
+      "joint": 4,
+      "can_id": 5,
+      "sdk_motor_type": 2,
+      "position_min_rad": -1.57,
+      "position_max_rad": 1.57,
+      "home_rad": 0.0,
+      "position_kp": 50.0,
+      "position_kd": 0.8,
+      "position_ki": 0.0,
+      "protect_kd": 1.0,
+      "sdk_gravity_scale": 1.32,
+      "feedback_current_threshold": 13.0
+    },
+    {
+      "joint": 5,
+      "can_id": 6,
+      "sdk_motor_type": 2,
+      "position_min_rad": -1.57,
+      "position_max_rad": 1.57,
+      "home_rad": 0.0,
+      "position_kp": 25.0,
+      "position_kd": 0.8,
+      "position_ki": 0.0,
+      "protect_kd": 1.0,
+      "sdk_gravity_scale": 1.32,
+      "feedback_current_threshold": 13.0
+    },
+    {
+      "joint": 6,
+      "can_id": 7,
+      "sdk_motor_type": 2,
+      "position_min_rad": -1.97,
+      "position_max_rad": 2.08,
+      "home_rad": 0.0,
+      "position_kp": 10.0,
+      "position_kd": 1.0,
+      "position_ki": 0.0,
+      "protect_kd": 1.0,
+      "sdk_gravity_scale": 1.32,
+      "feedback_current_threshold": 13.0
+    }
+  ],
+  "gripper_motor": {
+    "can_id": 8,
+    "sdk_motor_type": 2,
+    "constructor_position_range_rad": [
+      0.0,
+      5.0
+    ],
+    "constructor_range_used_by_CatchPositionCtrl": false,
+    "home_rad": null,
+    "home_reference": "Runtime feedback position after >699 initialization updates; getter subtracts this reference. Type 2 arm then sends set-zero.",
+    "current_threshold_stored": 13,
+    "current_threshold_checked": false
+  },
+  "home_profiles": {
+    "sdk_default": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "ros1_remote_master": [
+      -0.112,
+      0.948,
+      0.858,
+      -0.573,
+      -0.105,
+      0.097
+    ],
+    "ros2_v2_collect": [
+      0.0,
+      0.948,
+      0.858,
+      -0.573,
+      0.0,
+      0.0
+    ]
+  },
+  "motor_protocols": [
+    {
+      "sdk_motor_type": 2,
+      "position_min": -12.5,
+      "position_max": 12.5,
+      "velocity_min": -45.0,
+      "velocity_max": 45.0,
+      "effort_min": -10.0,
+      "effort_max": 10.0,
+      "kp_max": 500.0,
+      "kd_max": 5.0,
+      "kp_min": 0,
+      "kd_min": 0,
+      "quantization_bits": [
+        16,
+        12,
+        12,
+        12,
+        12
+      ],
+      "command_order": [
+        "position",
+        "velocity",
+        "kp",
+        "kd",
+        "effort"
+      ],
+      "packed_bits": [
+        16,
+        12,
+        12,
+        12,
+        12
+      ],
+      "feedback_bits": [
+        16,
+        12,
+        12
+      ],
+      "feedback_effort_copied_to_current_and_torque": true,
+      "timeout_us": 800000
+    },
+    {
+      "sdk_motor_type": 4,
+      "position_min": -12.5,
+      "position_max": 12.5,
+      "velocity_min": -18.0,
+      "velocity_max": 18.0,
+      "effort_min": -30.0,
+      "effort_max": 30.0,
+      "kp_max": 500.0,
+      "kd_max": 50.0,
+      "kp_min": 0,
+      "kd_min": 0,
+      "quantization_bits": [
+        16,
+        12,
+        12,
+        12,
+        12
+      ],
+      "command_order": [
+        "position",
+        "velocity",
+        "kp",
+        "kd",
+        "effort"
+      ],
+      "packed_bits": [
+        16,
+        12,
+        12,
+        9,
+        12
+      ],
+      "feedback_bits": [
+        16,
+        12,
+        12
+      ],
+      "feedback_effort_copied_to_current_and_torque": true,
+      "timeout_us": 100000
+    }
+  ],
+  "binary_constants": {
+    "controller_lower_rad": {
+      "virtual_address": "0x326b0",
+      "format": "d",
+      "values": [
+        -2.618,
+        -0.1,
+        -0.1,
+        -1.57,
+        -1.57,
+        -1.97,
+        0.0
+      ]
+    },
+    "controller_upper_rad": {
+      "virtual_address": "0x326e8",
+      "format": "d",
+      "values": [
+        3.14,
+        3.6,
+        3.0,
+        1.57,
+        1.57,
+        2.08,
+        5.0
+      ]
+    },
+    "position_kp": {
+      "virtual_address": "0x320e0",
+      "format": "d",
+      "values": [
+        150.0,
+        150.0,
+        150.0,
+        50.0,
+        25.0,
+        10.0
+      ]
+    },
+    "position_kd": {
+      "virtual_address": "0x320a0",
+      "format": "d",
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        0.8,
+        0.8,
+        1.0
+      ]
+    },
+    "position_ki": {
+      "virtual_address": "0x32060",
+      "format": "d",
+      "values": [
+        50.0,
+        50.0,
+        50.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "protect_kd": {
+      "virtual_address": "0x32120",
+      "format": "d",
+      "values": [
+        1.0,
+        4.0,
+        4.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "feedback_current_threshold": {
+      "virtual_address": "0x321e0",
+      "format": "d",
+      "values": [
+        13.0,
+        13.0,
+        13.0,
+        13.0,
+        13.0,
+        13.0,
+        13.0
+      ]
+    },
+    "type2_position_min": {
+      "virtual_address": "0x34e00",
+      "format": "d",
+      "values": [
+        -12.5
+      ]
+    },
+    "type2_position_max": {
+      "virtual_address": "0x34df8",
+      "format": "d",
+      "values": [
+        12.5
+      ]
+    },
+    "type2_velocity_min": {
+      "virtual_address": "0x34e28",
+      "format": "d",
+      "values": [
+        -45.0
+      ]
+    },
+    "type2_velocity_max": {
+      "virtual_address": "0x34e30",
+      "format": "d",
+      "values": [
+        45.0
+      ]
+    },
+    "type2_effort_min": {
+      "virtual_address": "0x34e38",
+      "format": "d",
+      "values": [
+        -10.0
+      ]
+    },
+    "type2_effort_max": {
+      "virtual_address": "0x34e40",
+      "format": "d",
+      "values": [
+        10.0
+      ]
+    },
+    "type2_kp_max": {
+      "virtual_address": "0x34e18",
+      "format": "d",
+      "values": [
+        500.0
+      ]
+    },
+    "type2_kd_max": {
+      "virtual_address": "0x34e20",
+      "format": "d",
+      "values": [
+        5.0
+      ]
+    },
+    "type4_position_min": {
+      "virtual_address": "0x34ea8",
+      "format": "d",
+      "values": [
+        -12.5
+      ]
+    },
+    "type4_position_max": {
+      "virtual_address": "0x34ea0",
+      "format": "d",
+      "values": [
+        12.5
+      ]
+    },
+    "type4_velocity_min": {
+      "virtual_address": "0x34ee0",
+      "format": "d",
+      "values": [
+        -18.0
+      ]
+    },
+    "type4_velocity_max": {
+      "virtual_address": "0x34ee8",
+      "format": "d",
+      "values": [
+        18.0
+      ]
+    },
+    "type4_effort_min": {
+      "virtual_address": "0x34ef0",
+      "format": "d",
+      "values": [
+        -30.0
+      ]
+    },
+    "type4_effort_max": {
+      "virtual_address": "0x34ef8",
+      "format": "d",
+      "values": [
+        30.0
+      ]
+    },
+    "type4_kp_max": {
+      "virtual_address": "0x34ec8",
+      "format": "d",
+      "values": [
+        500.0
+      ]
+    },
+    "type4_kd_max": {
+      "virtual_address": "0x34ed0",
+      "format": "d",
+      "values": [
+        50.0
+      ]
+    },
+    "cartesian_lower": {
+      "virtual_address": "0x321a0",
+      "format": "d",
+      "values": [
+        0.0,
+        -0.53,
+        -0.53,
+        -1.7453292519943295,
+        -1.4835298641951802,
+        -1.4835298641951802
+      ]
+    },
+    "cartesian_upper": {
+      "virtual_address": "0x32160",
+      "format": "d",
+      "values": [
+        0.53,
+        0.53,
+        0.53,
+        1.7453292519943295,
+        1.4835298641951802,
+        1.4835298641951802
+      ]
+    },
+    "position_interpolation": {
+      "virtual_address": "0x326a0",
+      "format": "d",
+      "values": [
+        0.5,
+        2.0
+      ]
+    },
+    "integral_limit_and_divisor": {
+      "virtual_address": "0x32730",
+      "format": "d",
+      "values": [
+        5.0,
+        200.0
+      ]
+    },
+    "home_acceleration": {
+      "virtual_address": "0x325b0",
+      "format": "d",
+      "values": [
+        0.08
+      ]
+    },
+    "home_speed": {
+      "virtual_address": "0x325a8",
+      "format": "d",
+      "values": [
+        0.2
+      ]
+    },
+    "home_arrival_velocity": {
+      "virtual_address": "0x325b8",
+      "format": "d",
+      "values": [
+        0.1
+      ]
+    },
+    "gripper_home_legacy_pv": {
+      "virtual_address": "0x32680",
+      "format": "d",
+      "values": [
+        0.0,
+        -5.0
+      ]
+    },
+    "gripper_home_2025_pv": {
+      "virtual_address": "0x32670",
+      "format": "d",
+      "values": [
+        0.0,
+        2.0
+      ]
+    },
+    "type4_offset_and_feedback_min": {
+      "virtual_address": "0x32720",
+      "format": "d",
+      "values": [
+        0.0,
+        -13.0
+      ]
+    },
+    "type4_feedback_max": {
+      "virtual_address": "0x325f8",
+      "format": "d",
+      "values": [
+        13.0
+      ]
+    },
+    "gripper_2025_lower": {
+      "virtual_address": "0x325c0",
+      "format": "d",
+      "values": [
+        -3.4
+      ]
+    },
+    "gripper_current_threshold": {
+      "virtual_address": "0x325d0",
+      "format": "d",
+      "values": [
+        1.2
+      ]
+    },
+    "gripper_contact_offset": {
+      "virtual_address": "0x325d8",
+      "format": "d",
+      "values": [
+        0.4
+      ]
+    },
+    "gripper_legacy_error_gain": {
+      "virtual_address": "0x325c8",
+      "format": "d",
+      "values": [
+        8.0
+      ]
+    },
+    "interpolation_fixed_dt": {
+      "virtual_address": "0x32eb0",
+      "format": "f",
+      "values": [
+        0.029999999329447746
+      ]
+    }
+  },
+  "unknown_motor_parameters": [
+    "commercial_model",
+    "gear_ratio",
+    "torque_constant_Nm_per_A",
+    "rated_voltage",
+    "rated_current",
+    "rated_torque",
+    "peak_torque",
+    "encoder_resolution",
+    "firmware_current_loop_PID",
+    "firmware_velocity_loop_PID",
+    "firmware_position_loop_PID",
+    "device_specific_zero_calibration"
+  ],
+  "controller_parameters": {
+    "overcurrent_samples": 200,
+    "integral_limit": 5.0,
+    "integral_divisor": 200.0,
+    "home_acceleration": 0.08,
+    "home_speed": 0.2,
+    "home_position_tolerance": 0.08,
+    "home_velocity_tolerance": 0.1,
+    "position_acceleration": 0.5,
+    "position_speed": 2.0,
+    "interpolation_argument3": 200.0,
+    "interpolation_actual_dt": 0.029999999329447746,
+    "gripper_home_samples": 700,
+    "gripper_home_done_kd": 2.0,
+    "write_motor_delay_us": 200
+  },
+  "gripper_profiles": [
+    {
+      "arm_types": [
+        0,
+        1
+      ],
+      "position_limit_active": false,
+      "position_min_rad": null,
+      "position_max_rad": null,
+      "kp": 0.0,
+      "kd": 0.2,
+      "effort_min": -2.0,
+      "effort_max": 2.0,
+      "error_gain": 8.0,
+      "position_bias": -0.1,
+      "home_velocity": -5.0,
+      "home_kd": 0.2,
+      "contact_check_active": false,
+      "contact_feedback_threshold": null,
+      "contact_samples": null,
+      "contact_position_offset": null
+    },
+    {
+      "arm_types": [
+        2
+      ],
+      "position_limit_active": true,
+      "position_min_rad": -3.4,
+      "position_max_rad": 0.1,
+      "kp": 2.0,
+      "kd": 0.1,
+      "effort_min": 0.0,
+      "effort_max": 0.0,
+      "error_gain": 0.0,
+      "position_bias": 0.0,
+      "home_velocity": 2.0,
+      "home_kd": 0.2,
+      "contact_check_active": true,
+      "contact_feedback_threshold": 1.2,
+      "contact_samples": 51,
+      "contact_position_offset": 0.4
+    }
+  ],
+  "motor_type4_position": {
+    "offset": 0.0,
+    "feedback_min": -13.0,
+    "feedback_max": 13.0,
+    "unwrap_jump_threshold": 12.5,
+    "unwrap_span": 25.0,
+    "command_wrap_span": 6.283185307179586
+  },
+  "urdf_limits": {
+    "position_min_rad": -10.0,
+    "position_max_rad": 10.0,
+    "effort": 100.0,
+    "velocity": 1000.0
+  }
+}

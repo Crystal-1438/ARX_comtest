@@ -6,6 +6,34 @@
 - `x5_gravity.c`：三角函数和重力递推，全部单精度。
 - `x5_gravity_data.h`：三个型号预计算常量。
 
+SDK 关节与电机参数已加入同目录的 **`x5_sdk_parameters.h/.c`**，需要时一并编译。
+内容包括六轴位置限幅、复位姿态、Kp/Kd/Ki、保护阻尼，以及七个电机的 CAN ID、
+SDK 类型、协议范围、反馈阈值和夹爪型号差异。
+全部为 `const float`/整数只读表，不需要初始化，也不自动执行控制或限幅。
+主机 GCC `-O2` 测得 `.text/.data/.bss` 都是 0，`.rodata` 为 832 字节
+（目标编译器对齐可能不同），`nm -u` 无外部依赖。
+
+```c
+#include "x5_sdk_parameters.h"
+
+/* 索引 0 是 J1；各角度单位 rad。 */
+float j1_lower = x5_sdk_joints[0].position_min_rad;
+float j2_home = x5_sdk_home_profiles[X5_SDK_HOME_DEFAULT][1];
+unsigned int j3_can_id = x5_sdk_motors[2].can_id; /* 4 */
+```
+
+这些参数的来源、适用模式和未知项见 [参数说明](../sdk_parameters/README.md)。
+其中夹爪 home 是运行时采集值，协议最大值不能当作电机额定参数。
+复位预设的索引是应用配置，不能用 `x5_model` 枚举索引复位表。
+将参数文件与重力模块独立编译，不使用时可以完全不加入。
+
+开发验证（不连接硬件）：
+
+```bash
+python3 gravity_compensation/sdk_parameters/generate_c.py --check
+.venv/bin/python -m unittest discover -s tests -p test_sdk_parameters.py -v
+```
+
 **不需要 ROS、KDL、Eigen、Python、libm、malloc 或初始化函数。**
 没有可变全局状态，可重入。仅使用 C 标准头文件里的类型/常量，不调用标准库函数。
 没有单精度 FPU 的 MCU 仍可能使用编译器自己的软浮点运行时；这不是模块引入的数学库。

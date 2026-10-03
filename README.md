@@ -10,6 +10,8 @@ SDK 状态映射、验证记录、未完成事项和下一步操作；[AGENTS.md
 需要单独研究或使用重力补偿计算时，见 [gravity_compensation](gravity_compensation/README.md)：
 已提取 URDF 模型、KDL 静态递推算法及厂商力矩缩放逻辑。当前提供面向 STM32 的
 [纯 C99 / float 版本](gravity_compensation/c/README.md)，无外部依赖；Python 版本保留作验证参考。
+独立模块还包含 [SDK 关节与电机参数](gravity_compensation/sdk_parameters/README.md)：
+关节限幅、复位预设、七个电机的控制/协议参数及对应 `const float` C 表。
 该模块仅计算六关节力矩，不连接机械臂，也不改变当前应用的停止/控制模式。
 
 ```text
