@@ -1,0 +1,4 @@
+# Preserve upstream files byte-for-byte, including historical whitespace.
+LICENSE -whitespace
+models/** -whitespace
+reference/** -whitespace
