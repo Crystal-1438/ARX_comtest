@@ -68,7 +68,7 @@ def generate(data):
         for p in data['gripper_profiles']])
     table('x5_sdk_type4_position_parameters', 'x5_sdk_type4_position', [
         floats(data['motor_type4_position'], 'offset feedback_min feedback_max '
-               'unwrap_jump_threshold unwrap_span command_wrap_span')])
+               'unwrap_jump_threshold unwrap_span command_wrap_span feedback_recenter_span')])
     table('x5_sdk_urdf_limit_parameters', 'x5_sdk_urdf_limits', [
         floats(data['urdf_limits'], 'position_min_rad position_max_rad effort velocity')])
     for name, key in [('min', 'cartesian_lower'), ('max', 'cartesian_upper')]:

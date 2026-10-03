@@ -553,6 +553,20 @@
       "values": [
         0.029999999329447746
       ]
+    },
+    "type4_feedback_recenter_span": {
+      "virtual_address": "0x34eb0",
+      "format": "d",
+      "values": [
+        6.283185307179586
+      ]
+    },
+    "type4_command_half_wrap_span": {
+      "virtual_address": "0x34ed8",
+      "format": "d",
+      "values": [
+        3.141592653589793
+      ]
     }
   },
   "unknown_motor_parameters": [
@@ -634,7 +648,8 @@
     "feedback_max": 13.0,
     "unwrap_jump_threshold": 12.5,
     "unwrap_span": 25.0,
-    "command_wrap_span": 6.283185307179586
+    "command_wrap_span": 6.283185307179586,
+    "feedback_recenter_span": 6.283185307179586
   },
   "urdf_limits": {
     "position_min_rad": -10.0,

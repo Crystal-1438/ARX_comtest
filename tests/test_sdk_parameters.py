@@ -56,6 +56,25 @@ class SourceParametersTest(unittest.TestCase):
                         'effort_min', 'effort_max', 'kp_max', 'kd_max']:
                 source = f"type{protocol['sdk_motor_type']}_{key}"
                 self.assertEqual(protocol[key], DATA['binary_constants'][source]['values'][0])
+        const = DATA['binary_constants']
+        self.assertEqual(DATA['motor_type4_position']['feedback_recenter_span'],
+                         const['type4_feedback_recenter_span']['values'][0])
+        self.assertEqual(DATA['motor_type4_position']['command_wrap_span'],
+                         2 * const['type4_command_half_wrap_span']['values'][0])
+        self.assertEqual(DATA['motor_type4_position']['unwrap_span'],
+                         2 * const['type4_position_max']['values'][0])
+        control_sources = {
+            'integral_limit': ('integral_limit_and_divisor', 0),
+            'integral_divisor': ('integral_limit_and_divisor', 1),
+            'home_acceleration': ('home_acceleration', 0),
+            'home_speed': ('home_speed', 0),
+            'home_position_tolerance': ('home_acceleration', 0),
+            'home_velocity_tolerance': ('home_arrival_velocity', 0),
+            'position_acceleration': ('position_interpolation', 0),
+            'position_speed': ('position_interpolation', 1),
+            'interpolation_actual_dt': ('interpolation_fixed_dt', 0)}
+        for key, (source, index) in control_sources.items():
+            self.assertEqual(DATA['controller_parameters'][key], const[source]['values'][index])
 
     def test_home_config_sources_and_urdf(self):
         profiles = ['ros1_remote_master', 'ros2_v2_collect']
@@ -139,6 +158,50 @@ class CParametersTest(unittest.TestCase):
         homes = ((C.c_float * 6) * 3).in_dll(self.lib, 'x5_sdk_home_profiles')
         for home, key in zip(homes, ['sdk_default', 'ros1_remote_master', 'ros2_v2_collect']):
             self.assertEqual(list(home), list(map(f32, DATA['home_profiles'][key])))
+
+    def test_compiled_control_gripper_and_auxiliary_tables(self):
+        control_keys = ('integral_limit integral_divisor home_acceleration home_speed '
+                        'home_position_tolerance home_velocity_tolerance position_acceleration '
+                        'position_speed interpolation_argument3 interpolation_actual_dt '
+                        'gripper_home_done_kd').split()
+        counter_keys = ['overcurrent_samples', 'gripper_home_samples', 'write_motor_delay_us']
+
+        class Control(C.Structure):
+            _fields_ = [(k, C.c_float) for k in control_keys]
+            _fields_ += [(k, C.c_uint16) for k in counter_keys]
+
+        control = Control.in_dll(self.lib, 'x5_sdk_control')
+        for key in control_keys:
+            self.assertEqual(getattr(control, key), f32(DATA['controller_parameters'][key]))
+        for key in counter_keys:
+            self.assertEqual(getattr(control, key), DATA['controller_parameters'][key])
+        gripper_keys = ('position_min_rad position_max_rad kp kd effort_min effort_max '
+                        'error_gain position_bias home_velocity home_kd '
+                        'contact_feedback_threshold contact_position_offset').split()
+
+        class Gripper(C.Structure):
+            _fields_ = [('position_limit_active', C.c_uint8), ('contact_check_active', C.c_uint8),
+                        ('contact_samples', C.c_uint16)]
+            _fields_ += [(k, C.c_float) for k in gripper_keys]
+
+        grippers = (Gripper * 2).in_dll(self.lib, 'x5_sdk_gripper_profiles')
+        for actual, expected in zip(grippers, DATA['gripper_profiles']):
+            for key in gripper_keys:
+                self.assertEqual(getattr(actual, key), f32(expected[key] or 0))
+            for key in ['position_limit_active', 'contact_check_active', 'contact_samples']:
+                self.assertEqual(getattr(actual, key), int(expected[key] or 0))
+        for name, key in [('min', 'cartesian_lower'), ('max', 'cartesian_upper')]:
+            actual = (C.c_float * 6).in_dll(self.lib, 'x5_sdk_cartesian_' + name)
+            self.assertEqual(list(actual), list(map(f32, DATA['binary_constants'][key]['values'])))
+        for symbol, section, keys in [
+                ('x5_sdk_type4_position', 'motor_type4_position',
+                 'offset feedback_min feedback_max unwrap_jump_threshold unwrap_span '
+                 'command_wrap_span feedback_recenter_span'),
+                ('x5_sdk_urdf_limits', 'urdf_limits',
+                 'position_min_rad position_max_rad effort velocity')]:
+            keys = keys.split()
+            actual = (C.c_float * len(keys)).in_dll(self.lib, symbol)
+            self.assertEqual(list(actual), [f32(DATA[section][k]) for k in keys])
 
 
 if __name__ == '__main__':

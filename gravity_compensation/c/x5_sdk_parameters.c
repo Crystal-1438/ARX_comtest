@@ -43,7 +43,7 @@ const x5_sdk_gripper_parameters x5_sdk_gripper_profiles[2] = {
 };
 
 const x5_sdk_type4_position_parameters x5_sdk_type4_position = {
-    0.0f, -13.0f, 13.0f, 12.5f, 25.0f, 6.283185307f,
+    0.0f, -13.0f, 13.0f, 12.5f, 25.0f, 6.283185307f, 6.283185307f,
 };
 
 const x5_sdk_urdf_limit_parameters x5_sdk_urdf_limits = {

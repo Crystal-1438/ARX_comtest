@@ -23,6 +23,7 @@ unsigned int j3_can_id = x5_sdk_motors[2].can_id; /* 4 */
 ```
 
 这些参数的来源、适用模式和未知项见 [参数说明](../sdk_parameters/README.md)。
+新增参数文件采用 BSD-3-Clause，许可文本在 `../sdk_parameters/reference/LICENSE`。
 其中夹爪 home 是运行时采集值，协议最大值不能当作电机额定参数。
 复位预设的索引是应用配置，不能用 `x5_model` 枚举索引复位表。
 将参数文件与重力模块独立编译，不使用时可以完全不加入。

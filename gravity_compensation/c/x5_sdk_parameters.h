@@ -67,6 +67,7 @@ typedef struct {
 typedef struct {
     float offset_rad, feedback_min_rad, feedback_max_rad;
     float unwrap_jump_threshold_rad, unwrap_span_rad, command_wrap_span_rad;
+    float feedback_recenter_span_rad;
 } x5_sdk_type4_position_parameters;
 
 typedef struct {

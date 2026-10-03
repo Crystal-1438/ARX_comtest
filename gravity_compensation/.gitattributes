@@ -2,3 +2,4 @@
 LICENSE -whitespace
 models/** -whitespace
 reference/** -whitespace
+sdk_parameters/reference/** -whitespace
