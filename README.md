@@ -7,6 +7,9 @@
 另一个 agent 接手时先阅读 [HANDOFF.md](HANDOFF.md)，其中包含需求确认、代码入口、
 SDK 状态映射、验证记录、未完成事项和下一步操作；[AGENTS.md](AGENTS.md) 提供简短入口约定。
 
+ENCOS 原厂手册的纯文字转换见 [ENCOS V1.20EAP 手册](docs/encos_v1_20/README.md)，
+包含图片参数表、CAN 位布局、公式、接线与界面说明，可直接交给没有识图能力的 AI。
+
 需要理解目标位置如何变成电机 CAN 帧时，见
 [ARX X5 SDK 数据流详解](ARX_X5_SDK_DATAFLOW.md)，包含插补、重力与积分计算、
 协议量化、MT4/MT2 字节布局、完整算例及二进制证据位置。
