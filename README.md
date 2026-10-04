@@ -7,6 +7,10 @@
 另一个 agent 接手时先阅读 [HANDOFF.md](HANDOFF.md)，其中包含需求确认、代码入口、
 SDK 状态映射、验证记录、未完成事项和下一步操作；[AGENTS.md](AGENTS.md) 提供简短入口约定。
 
+需要理解目标位置如何变成电机 CAN 帧时，见
+[ARX X5 SDK 数据流详解](ARX_X5_SDK_DATAFLOW.md)，包含插补、重力与积分计算、
+协议量化、MT4/MT2 字节布局、完整算例及二进制证据位置。
+
 需要单独研究或使用重力补偿计算时，见 [gravity_compensation](gravity_compensation/README.md)：
 已提取 URDF 模型、KDL 静态递推算法及厂商力矩缩放逻辑。当前提供面向 STM32 的
 [纯 C99 / float 版本](gravity_compensation/c/README.md)，无外部依赖；Python 版本保留作验证参考。
